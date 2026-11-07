@@ -141,6 +141,22 @@ def stats():
     return out
 
 
+def capsolver_balance():
+    """查 CapSolver 余额（美元），失败返回 None。"""
+    key = get_setting("capsolver", "")
+    if not key:
+        return None
+    try:
+        r = requests.post(f"{CAPSOLVER_API_URL}/getBalance",
+                          json={"clientKey": key}, timeout=10)
+        data = r.json()
+        if data.get("errorId") == 0:
+            return float(data.get("balance", 0))
+    except Exception:
+        pass
+    return None
+
+
 def clean_phone(phone):
     digits = re.sub(r'\D', '', str(phone or ''))
     if len(digits) == 10:
