@@ -12,6 +12,12 @@ selftest_result.txt
 gui_shot.png
 *.png
 captcha*.html
+# 打包产物（本地生成，不入库）
+_internal/
+ms-playwright/
+*.exe
+# 构建/测试日志
+*.log
 # 本地调试/验证脚本
 _*.py
 test_*.py

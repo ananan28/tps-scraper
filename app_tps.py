@@ -39,7 +39,7 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         eng.init_db()
-        self.setWindowTitle("TPS 抓取器 v1.8.0")
+        self.setWindowTitle("TPS 抓取器 v1.8.2")
         self.resize(1400, 900)
         self.bridge = Bridge()
         self.bridge.log.connect(self.log)

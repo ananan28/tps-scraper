@@ -837,17 +837,41 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                 except Exception:
                     pass
                 page = context.new_page()
-                # 拦截无用资源：图片/字体/媒体/广告/分析，省 70-85% 流量
+                # 拦截无用资源：图片/字体/媒体/CSS样式表/杂项 + 广告分析脚本，省流量
+                # 数据全在 HTML/DOM 里（用 inner_text/evaluate 取），CSS 只影响视觉不影响抓取
+                _BLOCK_TYPES = ("image", "font", "media", "websocket",
+                                "stylesheet", "manifest", "texttrack", "ping", "other")
+                _BLOCK_DOMAINS = (
+                    "googleads", "googlesyndication", "googletagmanager",
+                    "doubleclick", "google-analytics", "adservice", "adsystem",
+                    "facebook.net", "facebook.com/tr", "connect.facebook",
+                    "amazon-adsystem", "adnxs", "adsrvr", "advertising",
+                    "cloudflareinsights", "hotjar", "clarity.ms", "bat.bing",
+                    "quantserve", "scorecardresearch", "chartbeat", "newrelic",
+                    "nr-data.net", "segment.io", "segment.com", "mixpanel",
+                    "optimizely", "crazyegg", "mouseflow", "fullstory",
+                    "heapanalytics", "amplitude", "branch.io", "appsflyer",
+                    "sentry.io", "bugsnag", "rollbar", "datadoghq", "loggly",
+                    "mc.yandex", "metrika", "webvisor", "top-fwz1.mail.ru",
+                    "analytics.twitter", "t.co/i/", "snap.licdn", "linkedin.com/px",
+                    "reddit.com/pixel", "tiktok.com/i18n", "ct.pinterest",
+                    "outbrain", "taboola", "criteo", "pubmatic", "rubiconproject",
+                    "openx", "casalemedia", "contextweb", "indexww", "33across",
+                    "sharethrough", "teads", "sonobi", "gumgum", "lijit", "sovrn",
+                    "zemanta", "mgid", "revcontent", "adblade", "content.ad",
+                    # 实测大头：Ezoic 广告平台（约占 42% 流量）
+                    "ezojs.com", "ezoic", "ezodn", "ezdicdn", "go.ezoic",
+                    # Clym cookie 同意弹窗（约占 17% 流量）
+                    "clym-widget", "clym.io", "clym.com",
+                    # 谷歌地图（数据不需要地图）
+                    "maps.googleapis", "maps.google",
+                )
                 def _block_request(route):
-                    if route.request.resource_type in ("image", "font", "media", "websocket"):
+                    if route.request.resource_type in _BLOCK_TYPES:
                         route.abort()
                         return
                     low_url = route.request.url.lower()
-                    if any(d in low_url for d in (
-                        "googleads", "googlesyndication", "googletagmanager",
-                        "doubleclick", "google-analytics", "adservice",
-                        "facebook.net", "amazon-adsystem", "adnxs",
-                    )):
+                    if any(d in low_url for d in _BLOCK_DOMAINS):
                         route.abort()
                         return
                     route.continue_()
