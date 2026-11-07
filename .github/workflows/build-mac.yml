@@ -26,12 +26,7 @@ jobs:
         run: python -m playwright install chromium
 
       - name: PyInstaller build .app
-        run: python -m PyInstaller --noconfirm --onedir --windowed \
-          --name "TPS抓取器" \
-          --collect-all playwright \
-          --collect-all playwright_stealth \
-          --collect-all certifi \
-          app_tps.py
+        run: python -m PyInstaller --noconfirm --onedir --windowed --name "TPS抓取器" --collect-all playwright --collect-all playwright_stealth --collect-all certifi app_tps.py
 
       - name: Bundle Chromium into .app
         run: |
