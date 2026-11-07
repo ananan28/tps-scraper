@@ -1,0 +1,65 @@
+name: Build macOS .app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install chromium
+
+      - name: PyInstaller build .app
+        run: python -m PyInstaller --noconfirm --onedir --windowed \
+          --name "TPS抓取器" \
+          --collect-all playwright \
+          --collect-all playwright_stealth \
+          --collect-all certifi \
+          app_tps.py
+
+      - name: Bundle Chromium into .app
+        run: |
+          APP="dist/TPS抓取器.app"
+          EXE_DIR="$APP/Contents/MacOS"
+          DST="$EXE_DIR/ms-playwright"
+          mkdir -p "$DST"
+          CACHE="$HOME/Library/Caches/ms-playwright"
+          for d in "$CACHE"/chromium*; do
+            [ -d "$d" ] && cp -R "$d" "$DST/"
+          done
+          echo "Chromium bundled into $DST"
+          ls "$DST"
+
+      - name: Codesign
+        run: |
+          codesign --force --deep --sign - "dist/TPS抓取器.app" || true
+          xattr -cr "dist/TPS抓取器.app" || true
+
+      - name: Zip .app for upload
+        run: |
+          cd dist
+          zip -r "TPS抓取器-macOS.zip" "TPS抓取器.app"
+          echo "ZIP_SIZE=$(du -sh 'TPS抓取器-macOS.zip' | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TPS抓取器-macOS
+          path: dist/TPS抓取器-macOS.zip
+          retention-days: 90
