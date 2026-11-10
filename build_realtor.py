@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
-NAME = "realtor经纪人抓取器"
+NAME = "Realtor经纪人抓取器"
 DIST = BASE / "dist_realtor" / NAME
 
 
