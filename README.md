@@ -19,14 +19,39 @@
 | 并发 | 15-20（32GB 内存机） | 直连 ≤6 页，超了会被临时硬封 | 实测 4 页很稳，更多待测 |
 | 性别筛选 | 界面可调（默认留男+中性+未知） | 只按姓名剔除女性，不可关 | 勾选框「剔除女性姓名」，默认开 |
 | 年龄 | 50-85 可调 | 不估龄 | 无年龄字段 |
-| 源码 | `engine_tps_v182.py` + `app_ui.py` | `realtor_engine.py` + `app_realtor.py` | `homes_engine.py` + `app_homes.py` |
+| 源码 | `engine_core.py` + `app_ui.py` | `realtor_engine.py` + `app_realtor.py` | `homes_engine.py` + `app_homes.py` |
 | 打包 | `build_ui.py` / `build.py` | `build_realtor.py` | `build_homes.py` |
 | 库文件 | `tps_data.db` | `realtor_data.db` | `homes_data.db` |
 | 实测速度 | 取决于代理与解码 | 受 Kasada 限制，慢但稳 | 本机直连 4 页：**328–368 人/分** |
 
-共用的东西：`engine_core.py`（姓名性别判定 + 姓名库 + TPS 引擎内核）、`user_names.json`（45,443 条姓名的性别库，本地生成，**不入库**）。
+共用的东西：`engine_core.py`（姓名性别判定 + 姓名库 + TPS 引擎内核，homes / realtor 的引擎也 import 它做性别过滤）、`user_names.json`（45,443 条姓名的性别库，本地生成，**不入库**）。
 
-## 二、交付出去的东西是什么
+## 二、仓库里每个文件拿来干嘛
+
+**正在用的（改这些）**
+
+| 文件 | 用途 |
+|---|---|
+| `engine_core.py` | TPS 引擎内核 + 姓名性别判定；homes / realtor 引擎共用它的性别过滤 |
+| `app_ui.py` | TPS 主用版界面（带可调阈值），入口就是它 |
+| `realtor_engine.py` / `app_realtor.py` | realtor.com 引擎 + 界面 |
+| `homes_engine.py` / `app_homes.py` | homes.com 引擎 + 界面 |
+| `build_ui.py` / `build_realtor.py` / `build_homes.py` | 各自打 Windows 免安装 EXE，产物落在 `dist_*` |
+| `build_mac.py` + `打包Mac.command` + `.github/workflows/build-mac.yml` | mac 端 `.app`：Windows 交叉打不出来，靠 GitHub Actions 在 mac runner 上构建 |
+| `copy_to_usb.py` | 把 `TPS_v1.8.2_UI` 整包拷 U 盘，数据库走 SQLite backup API 做一致快照（不会拷到半截的 `-wal`） |
+| `requirements.txt` | 依赖清单 |
+
+**留着但对比的旧版（别改，除非要复现行为差异）**
+
+| 文件 | 用途 |
+|---|---|
+| `engine_tps.py` / `app_tps.py` / `build.py` | TPS v3.0.0 试验版，后来回到 1.8.2 内核，现由 `engine_core.py` + `app_ui.py` 取代 |
+| `app_tps_v182.py` | 更早的 1.8.2 简易界面，同样已被 `app_ui.py` 取代 |
+| `CHANGELOG_v3.0.0.md` | v3.0.0 那次改了什么，留档 |
+
+只有 `engine_core.py` / `app_ui.py` / `realtor_engine.py` / `app_realtor.py` / `homes_engine.py` / `app_homes.py` 是日常在改的；其余都在仓库历史里躺着，不用拷到别的机器。
+
+## 三、交付出去的东西是什么
 
 打包产物都落在各自 `dist_*` 目录，再拷到桌面顶层变成可双击的成品文件夹。每个文件夹都是**自包含**的：EXE + `_internal` + `user_names.json` + 自己的 `.db`，整文件夹拷 U 盘就能在别的机器跑。
 
