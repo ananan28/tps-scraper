@@ -365,7 +365,7 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
     found = saved = known = fem = nop = dup = 0
     pages_total = 0
     empty_try = 0
-    blocked_out = stopped = invalid = stuck = False
+    blocked_out = stopped = invalid = stuck = empty_out = False
     new_slugs = set()
     while page <= MAX_PAGE and not stop.is_set():
         html = await _load(tab, slug_url(slug, page), wait, 6, st["gate"], stop)
@@ -393,11 +393,17 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
             break
         cards = parse_cards(html)
         if not cards:
-            # 中间页返回 0 张卡片不一定是尾页，先重进两次
-            if pages_total and page < pages_total and empty_try < 2:
+            # 能翻到空白页说明上一页是满的 48 张，这个地区大概率还有货，先重进两次
+            if page < (pages_total or page) and empty_try < 2:
                 empty_try += 1
                 await asyncio.sleep(wait + 2)
                 continue
+            if page < (pages_total or page):
+                # 重进完还是空：网站明明报了更多页，不能当抓完，排回队尾等下一轮
+                st["empties"] += 1
+                _set_slug_status(slug, "pending", pages_total, found, saved, page=page)
+                empty_out = True
+                break
             break
         empty_try = 0
         found += len(cards)
@@ -444,7 +450,7 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
     st["slugs_done"] += 1
     if stopped:
         _set_slug_status(slug, "pending", pages_total, found, saved, page=page)
-    elif not (blocked_out or invalid or stuck):
+    elif not (blocked_out or invalid or stuck or empty_out):
         _set_slug_status(slug, "done", pages_total, found, saved, page=1)
     note = (f" | 进度 {st['slugs_done']}/{st['slugs_total']} "
             f"新发现{added}个地区 队列剩{st['queue'].qsize()}")
@@ -458,6 +464,10 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
     if stuck:
         progress_cb(f"⏳ {slug}: 第{page}页挑战页{int(wait)*6}秒内没自己过 → 已存{saved}人，"
                     f"已排回队尾不算失败{note}")
+        return
+    if empty_out:
+        progress_cb(f"↪ {slug}: 第{page}页空卡片但网站说有{pages_total}页，重进2次还是空 "
+                    f"→ 已存{saved}人，排回队尾下次从第{page}页续{note}")
         return
     if invalid:
         progress_cb(f"⚠ {slug}: 不是地区专页（网站返回通用搜索页）→ 存0人{note}")
@@ -476,7 +486,7 @@ async def _heartbeat(st, progress_cb, stop, started):
         progress_cb(f"心跳: 地区 {st['slugs_done']}/{st['slugs_total']} "
                     f"页{st['pages']} 存{st['agents']}人（有号{st['phones']} 无号{st['nophone']}）"
                     f" {rate:.1f}人/分 并发{len(st['inflight'])}个{cool} "
-                    f"硬拒绝{st['blocks']}次 挑战没过{st['challenges']}次 "
+                    f"硬拒绝{st['blocks']}次 挑战没过{st['challenges']}次 空页{st['empties']}次 "
                     f"退避{st['gate'].trips}次 新地区{st['new_slugs']}个")
 
 
@@ -508,7 +518,7 @@ async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
         queue.put_nowait(item)
     st = {"browser": browser, "queue": queue, "seen": known_keys(), "slugs_done": 0,
           "slugs_total": len(items), "agents": 0, "phones": 0, "nophone": 0,
-          "pages": 0, "blocks": 0, "challenges": 0, "new_slugs": 0,
+          "pages": 0, "blocks": 0, "challenges": 0, "empties": 0, "new_slugs": 0,
           "queued": {s for s, _ in items},
           "inflight": set(), "cursor": {}, "gate": Gate()}
     await _warm_up(browser, progress_cb, stop)

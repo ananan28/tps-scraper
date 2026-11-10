@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 import homes_engine as eng
 from browser_path import browser_kind, check_text, find_browser, set_override
 
-BASE = Path(__file__).resolve().parent
+BASE = eng.BASE
 CFG = BASE / "homes_config.json"
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
