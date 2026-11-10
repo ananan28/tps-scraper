@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 import realtor_engine as eng
+from browser_path import browser_kind, check_text, find_browser, set_override
 
 BASE = Path(__file__).resolve().parent
 CFG = BASE / "realtor_config.json"
@@ -105,6 +106,26 @@ class Main(QMainWindow):
         self.proxy_pass.setPlaceholderText("代理密码")
         g.addWidget(QLabel("代理密码"), row, 0)
         g.addWidget(self.proxy_pass, row, 1)
+        row += 1
+        hb = QHBoxLayout()
+        self.browser_edit = QLineEdit()
+        self.browser_edit.setPlaceholderText(
+            "留空就行：本机 Chrome/Edge → 没有的话自动用软件自带的 Chromium")
+        self.browser_edit.setToolTip(
+            "抓取器要起一个真浏览器窗口。优先级：\n"
+            "1) 这一栏手选的路径；\n"
+            "2) 本机已装的 Chrome / Edge / Brave（注册表 App Paths → 各盘符 "
+            "Program Files → 所有用户配置目录 → PATH）；\n"
+            "3) 前两级都没有，就用交付文件夹里自带的 browser\\chrome-win64\\chrome.exe。\n"
+            "真 Chrome 的指纹比自带的干净 Chromium 更像普通用户，所以本机装了就用本机那份。")
+        btn_browse = QPushButton("浏览…")
+        btn_browse.clicked.connect(self.pick_browser)
+        btn_detect = QPushButton("自动检测")
+        btn_detect.clicked.connect(self.detect_browser)
+        hb.addWidget(self.browser_edit)
+        hb.addWidget(btn_browse)
+        hb.addWidget(btn_detect)
+        g.addLayout(hb, row, 0, 1, 2)
         cfg.setLayout(g)
         form.addWidget(cfg)
 
@@ -216,6 +237,7 @@ class Main(QMainWindow):
                 "tabs_per_ip": self.tabs_per_ip.value(),
                 "proxy_url": self.proxy_url.text().strip(),
                 "proxy_pass": self.proxy_pass.text().strip(),
+                "browser_path": self.browser_edit.text().strip(),
             }), encoding="utf-8")
         except OSError:
             pass
@@ -231,6 +253,39 @@ class Main(QMainWindow):
         self.tabs_per_ip.setValue(int(c.get("tabs_per_ip", 4)))
         self.proxy_url.setText(c.get("proxy_url", ""))
         self.proxy_pass.setText(c.get("proxy_pass", ""))
+        self.browser_edit.setText(str(c.get("browser_path", "")))
+        set_override(self.browser_edit.text())
+
+    # ---------- browser ----------
+    def pick_browser(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "选浏览器主程序", "",
+            "浏览器 (chrome.exe msedge.exe brave.exe chromium.exe);;所有文件 (*.*)")
+        if p:
+            self.browser_edit.setText(p)
+            self.log(f"浏览器已指到：{set_override(p) or '这个路径不存在，再选一次'}")
+
+    def detect_browser(self):
+        set_override("")
+        self.browser_edit.clear()
+        self.log("浏览器自检：\n" + check_text())
+
+    def need_browser(self):
+        """启动前的硬门槛：一个浏览器都起不了就别开线程，把话说清楚。"""
+        set_override(self.browser_edit.text())
+        exe = find_browser()
+        if not exe:
+            QMessageBox.warning(
+                self, "起不了浏览器",
+                "抓取器要起一个真浏览器窗口，但这台机器上找不到，"
+                "软件自带的那份 Chromium 也不在（缺 browser 目录）。\n\n"
+                + check_text() +
+                "\n\n要么装个 Chrome，要么把交付文件夹里的 browser 目录补回来，"
+                "要么在「浏览器路径」里手动指一个。")
+            self.log("启动失败：本机没浏览器，且 browser 目录里也没有自带的 Chromium。")
+            return ""
+        self.log(f"浏览器：{exe}（{browser_kind(exe)}）")
+        return exe
 
     def _extract_zips(self, text):
         return [z for z in ZIP_TOKEN.findall(text or "")]
@@ -269,6 +324,9 @@ class Main(QMainWindow):
             return
         self.running = True
         self.stop_flag.clear()
+        if not self.need_browser():
+            self.running = False
+            return
         self._t0 = time.time()
         self._n_log = 0
         self.btn_start.setEnabled(False)
@@ -349,6 +407,13 @@ class Main(QMainWindow):
 
 
 def main():
+    if "--check-browser" in sys.argv:
+        # 打包成 --windowed 后没有控制台，自检结果落到 exe 旁边的文件里
+        txt = check_text()
+        (Path(sys.argv[0]).resolve().parent / "browser_check.txt").write_text(
+            txt, encoding="utf-8")
+        print(txt)
+        return
     app = QApplication(sys.argv)
     w = Main()
     w.show()

@@ -36,8 +36,9 @@
 | `app_ui.py` | TPS 主用版界面（带可调阈值），入口就是它 |
 | `realtor_engine.py` / `app_realtor.py` | realtor.com 引擎 + 界面 |
 | `homes_engine.py` / `app_homes.py` | homes.com 引擎 + 界面 |
-| `browser_path.py` | 本机 Chrome/Edge 定位（注册表 App Paths → 常见安装目录 → PATH）。nodriver 自带的探测只翻环境变量，打包到别的机器上会直接报 "could not find chrome browser binary"，两个 nodriver 引擎都改成显式传 `browser_executable_path` |
-| `build_ui.py` / `build_realtor.py` / `build_homes.py` | 各自打 Windows 免安装 EXE，产物落在 `dist_*` |
+| `browser_path.py` | 浏览器定位，三级顺序：界面手选的路径 → 本机装的 Chrome/Edge/Brave（注册表 App Paths → 各盘符 Program Files → `C:\Users\*` 所有用户配置 → PATH）→ 交付文件夹自带的 `browser\chrome-win64\chrome.exe`。nodriver 自带的探测只翻 PROGRAMFILES 环境变量，换台机器就报 "could not find chrome browser binary"，所以两个 nodriver 引擎都显式传 `browser_executable_path`。用自带那份时自动加 `--no-sandbox`（非标准安装路径下 Chromium 沙箱会报 "Sandbox cannot access executable"），本机真 Chrome 不动 |
+| `bundle_browser.py` | 打包时把本机 `ms-playwright` 里那份 Chromium 塞进交付文件夹的 `browser\`（同盘优先硬链接，不额外占空间；目标机没装任何浏览器也能跑）。源在 `C:\Users\<你>\AppData\Local\ms-playwright\chromium-*\chrome-win64`，没有就先 `python -m playwright install chromium` |
+| `build_ui.py` / `build_realtor.py` / `build_homes.py` | 各自打 Windows 免安装 EXE，产物落在 `dist_*`；后两个还会调 `bundle_browser` 带上一份 Chromium，并生成 `启动*.bat` + `浏览器自检.bat` |
 | `build_mac.py` + `打包Mac.command` + `.github/workflows/build-mac.yml` | mac 端 `.app`：Windows 交叉打不出来，靠 GitHub Actions 在 mac runner 上构建 |
 | `copy_to_usb.py` | 把 `TPS_v1.8.2_UI` 整包拷 U 盘，数据库走 SQLite backup API 做一致快照（不会拷到半截的 `-wal`） |
 | `requirements.txt` | 依赖清单 |
@@ -54,12 +55,14 @@
 
 ## 三、交付出去的东西是什么
 
-打包产物都落在各自 `dist_*` 目录，再拷到桌面顶层变成可双击的成品文件夹。每个文件夹都是**自包含**的：EXE + `_internal` + `user_names.json` + 自己的 `.db`，整文件夹拷 U 盘就能在别的机器跑。
+打包产物都落在各自 `dist_*` 目录，再拷到桌面顶层变成可双击的成品文件夹。每个文件夹都是**自包含**的：EXE + `_internal` + `user_names.json` + 自己的 `.db`
++ `browser\`（homes / realtor 自带的那份 Chromium，约 447 MB），整文件夹拷 U 盘就能在别的机器跑，
+目标机一个浏览器都没装也不影响。
 
 | 桌面文件夹 | 是什么 |
 |---|---|
-| `Homes经纪人抓取器\` | homes.com 抓取器成品（最新，带兜底页校验） |
-| `Realtor经纪人抓取器\` | realtor.com 抓取器成品 |
+| `Homes经纪人抓取器\` | homes.com 抓取器成品（最新，带兜底页校验 + 自带 Chromium + `浏览器自检.bat`） |
+| `Realtor经纪人抓取器\` | realtor.com 抓取器成品（同样自带 Chromium） |
 | `TPS_v1.8.2_UI\` | **TPS 唯一在用版**：1.8.2 引擎 + 可调阈值界面，内置 Chromium（`ms-playwright`） |
 | `phonedb\` | 号码库数据目录（不是软件），源码在另一个仓库 [phonedb](https://github.com/ananan28/phonedb) |
 | `tps-scraper\` | **就是这个仓库**：全部源码 |
@@ -83,6 +86,8 @@
 1. 装依赖：`pip install -r requirements.txt`
 2. 打包：`python build_homes.py`（约 80 秒，产物在 `dist_homes\homes经纪人抓取器\`）
 3. 把该文件夹整个拷到目标机（或 U 盘中转），双击 `Homes经纪人抓取器.exe`
+   - 换机器起不了浏览器时，双击同目录的 `浏览器自检.bat`，它会生成 `browser_check.txt`，
+     里面写清楚「实际会用哪个、本机装了几个、自带的那份在不在、查过多少个位置」
 4. 首次运行会在 EXE 同级自动建库；界面里设并发/等待，导入地区或点「填入 50 个州」
 5. 勾选「自动发现下级地区」→ 引擎自己从州扒到县、市、相邻市
 6. 抓完点「导出 CSV」，输出在 EXE 同级
@@ -112,7 +117,11 @@ realtor 和 homes 都不吃这两项：走本机直连、无验证码。代价�
 - homes 的纯数字路径（如 `/33137/`）**不返回 404**，而是返回一个 24 人的通用搜索页；引擎按 canonical 识别这种兜底页并标为「无效地区」，不入库
 - realtor 直连并发超过 6 页会被硬封十几分钟
 - 拷贝正在使用的 SQLite 库之前**必须先 checkpoint**（`PRAGMA wal_checkpoint(TRUNCATE)`），只拷 `.db` 会丢掉还在 `-wal` 里的行
-- 目标机报 `could not find chrome browser binary` 时别再依赖 nodriver 自动探测：`browser_path.py` 会先查注册表 App Paths、再查常见安装目录和 PATH，Chrome 优先 Edge 兜底，显式传给 `uc.start(browser_executable_path=...)`；一个都没找到就在界面里明说"本机没装 Chrome/Edge"并列出查过的位置
+- 目标机报 `could not find chrome browser binary` 时别再依赖 nodriver 自动探测：`browser_path.py` 按
+  手选路径 → 注册表 App Paths / 各盘符 Program Files / 所有用户配置 / PATH → 自带的 `browser\chrome-win64`
+  三级往下找，显式传给 `uc.start(browser_executable_path=...)`。用户那台没装 Chrome 的电脑走的就是第三级。
+  界面日志会写明用的是哪一个（本机已装 / 软件自带 / 手动指定），因为自带那份是干净 Chromium，
+  过 Akamai 不如真 Chrome，能装 Chrome 就还是装
 - TPS 抓到 0 号码基本只有一个原因：2Captcha 没额度，不是命中率低
 
 ## 八、多电脑部署

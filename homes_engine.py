@@ -16,7 +16,7 @@ from datetime import datetime
 import nodriver as uc
 
 from engine_core import BASE, is_obvious_female, name_gender
-from browser_path import describe_search, find_browser
+from browser_path import browser_kind, describe_search, find_browser, is_bundled
 
 DB_PATH = BASE / "homes_data.db"
 HOMES_HOST = "https://www.homes.com"
@@ -436,10 +436,12 @@ async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
                      discover, drop_female):
     exe = find_browser()
     if not exe:
-        raise RuntimeError("本机没找到 Chrome/Edge，起不了浏览器。装个 Chrome 再跑（查过 "
-                           + describe_search() + "）")
-    progress_cb(f"浏览器：{exe}")
-    browser = await uc.start(headless=False, browser_executable_path=exe)
+        raise RuntimeError("既没在本机找到 Chrome/Edge/Brave，交付文件夹里的 browser 目录"
+                           "也没有自带的 Chromium，起不了浏览器。在「抓取设置 → 浏览器路径」"
+                           "里手动指一个（查过 " + describe_search() + "）")
+    progress_cb(f"浏览器：{exe}（{browser_kind(exe)}）")
+    browser = await uc.start(headless=False, browser_executable_path=exe,
+                               sandbox=not is_bundled(exe))
     queue = asyncio.Queue()
     items = queue_items(slugs)
     for item in items:

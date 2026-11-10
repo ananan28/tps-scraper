@@ -16,7 +16,7 @@ import nodriver as uc
 
 import engine_core as eng
 from engine_core import BASE, is_obvious_female, name_gender
-from browser_path import describe_search, find_browser
+from browser_path import browser_kind, describe_search, find_browser, is_bundled
 
 DB_PATH = BASE / "realtor_data.db"
 REALTOR_HOST = "https://www.realtor.com"
@@ -263,10 +263,12 @@ class Lane:
     async def start(self):
         exe = find_browser()
         if not exe:
-            raise RuntimeError("本机没找到 Chrome/Edge，起不了浏览器。装个 Chrome 再跑"
+            raise RuntimeError("既没在本机找到 Chrome/Edge/Brave，browser 目录里也没有"
+                               "自带的 Chromium，起不了浏览器。在「浏览器路径」里手动指一个"
                                "（查过 " + describe_search() + "）")
         args = self._args()
-        kw = {"headless": False, "browser_executable_path": exe}
+        kw = {"headless": False, "browser_executable_path": exe,
+              "sandbox": not is_bundled(exe)}
         if args:
             kw["browser_args"] = args
         self.browser = await uc.start(**kw)
