@@ -197,6 +197,27 @@ class Main(QMainWindow):
         g.addWidget(QLabel("代理出口"), row, 0)
         g.addLayout(pv, row, 1)
         row += 1
+        self.rotate_ip = QCheckBox("被连续硬拒绝就重开浏览器换出口 IP（同账号新 session，不用另买）")
+        self.rotate_ip.setChecked(True)
+        self.rotate_ip.setToolTip(
+            "一个 session 参数 = 一个固定住宅 IP，整个浏览器只走它，Akamai 的 token 才对得上。\n"
+            "实测：不带 session 参数时 LinkUp 每个请求换一个 IP，跑两分钟就被判定成机器人"
+            "（表现就是“一直退避进不去”）。\n"
+            "新版：① 每个浏览器固定一个 session；② 连续被硬拒绝就整个重开、换一个新 session 接着跑，"
+            "不再干等冷却。\n"
+            "不勾这一项 = 从头到尾死守同一个出口 IP，被拦就只会在原地退避。")
+        g.addWidget(QLabel("出口轮换"), row, 0)
+        g.addWidget(self.rotate_ip, row, 1)
+        row += 1
+        self.lite = QCheckBox("省流量：图片/CSS/字体/视频不加载，第三方统计脚本按域名拦掉")
+        self.lite.setChecked(True)
+        self.lite.setToolTip(
+            "目录页的人名电话全在 HTML 里，图片样式一张都不需要。\n"
+            "网站自己的 JS 保留 —— 那张 2.4KB 挑战页靠脚本 reload 才会变成真页面，"
+            "把 *.js 全屏蔽会让每一页都卡在挑战页上。")
+        g.addWidget(QLabel("省流量"), row, 0)
+        g.addWidget(self.lite, row, 1)
+        row += 1
         tip = QLabel("列表页就带电话，不进详情页。目录页会先回一张 2.4KB 的挑战页，"
                      "它自己 reload 后 4~25 秒变成真页面——新版引擎原地等它，不再误判成被拦。")
         tip.setWordWrap(True)
@@ -325,6 +346,8 @@ class Main(QMainWindow):
                 "browser_path": self.browser_edit.text().strip(),
                 "proxy": self.proxy_edit.text().strip(),
                 "proxy_pass": self.proxy_pass.text(),
+                "rotate_ip": self.rotate_ip.isChecked(),
+                "lite": self.lite.isChecked(),
             }), encoding="utf-8")
         except OSError:
             pass
@@ -342,6 +365,8 @@ class Main(QMainWindow):
         self.browser_edit.setText(str(c.get("browser_path", "")))
         self.proxy_edit.setText(str(c.get("proxy", "")))
         self.proxy_pass.setText(str(c.get("proxy_pass", "")))
+        self.rotate_ip.setChecked(bool(c.get("rotate_ip", True)))
+        self.lite.setChecked(bool(c.get("lite", True)))
         set_override(self.browser_edit.text())
 
     # ---------- browser ----------
@@ -434,10 +459,14 @@ class Main(QMainWindow):
         female = self.drop_female.isChecked()
         proxy = self.proxy_edit.text().strip()
         proxy_pass = self.proxy_pass.text()
+        rotate_ip = self.rotate_ip.isChecked()
+        lite = self.lite.isChecked()
         self.save_config()
         self.log(f"启动：并发 {conc} 页，每页等 {wait:.0f}s，待处理 {len(slugs)} 个地区，"
                  f"{'自动发现' if disc else '不发现'}，{'剔女' if female else '男女都留'}，"
-                 f"{'走代理' if proxy else '本机直连'}")
+                 f"{'走代理' if proxy else '本机直连'}，"
+                 f"{'被拦换出口IP' if rotate_ip and proxy else '出口IP固定'}，"
+                 f"{'不拉图片样式' if lite else '图片样式照拉'}")
 
         def cb(msg):
             self.bridge.log.emit(msg)
@@ -446,7 +475,8 @@ class Main(QMainWindow):
             try:
                 eng.run_batch(slugs, concurrency=conc, progress_cb=cb, stop=self.stop_flag,
                               wait=wait, pace=pace, discover=disc, drop_female=female,
-                              proxy=proxy, proxy_pass=proxy_pass)
+                              proxy=proxy, proxy_pass=proxy_pass,
+                              rotate_ip=rotate_ip, lite=lite)
                 self.bridge.log.emit("全部完成" if not self.stop_flag.is_set() else "已停止")
             except Exception as e:
                 self.bridge.log.emit(f"运行出错: {e}")

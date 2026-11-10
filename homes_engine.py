@@ -14,6 +14,7 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 
 import nodriver as uc
@@ -43,6 +44,47 @@ _CANON = re.compile(r'canonical[^>]*href="https?://www\.homes\.com/real-estate-a
 _BLOCKED = ("Access Denied", "edgesuite", "Attention Required", "Pardon Our Interruption")
 _CHALLENGE = ("Powered and protected by", "chlgeId", "privacywall",
               "Checking your browser", "cf-chl")
+
+# 目录页只要有 HTML 就能出人，图片/CSS/字体是白烧的流量和白送的请求数。
+# 住宅代理按流量算钱，Akamai 按请求数限速，屏蔽它们同时省两样。
+# 两个坑：① Chrome 只认 URLPattern 写法（*://*/*.jpg），裸 glob "*.jpg" 直接被拒；
+# ② 绝不能屏蔽 homes.com 自己的 JS —— 那张 2.4KB 挑战页靠脚本 location.reload 才过得去，
+#    把 *.js 全屏蔽会让每一页都变成永远过不去的挑战页。所以第三方脚本只按域名屏蔽。
+_LITE_BLOCK = ["*://*/*.jpg", "*://*/*.jpeg", "*://*/*.png", "*://*/*.webp",
+               "*://*/*.gif", "*://*/*.svg", "*://*/*.ico", "*://*/*.avif",
+               "*://*/*.bmp", "*://*/*.css", "*://*/*.woff", "*://*/*.woff2",
+               "*://*/*.ttf", "*://*/*.otf", "*://*/*.eot", "*://*/*.mp4",
+               "*://*/*.webm", "*://*/*.map",
+               "*://*.google-analytics.com/*", "*://*.googletagmanager.com/*",
+               "*://*.doubleclick.net/*", "*://*.facebook.net/*",
+               "*://*.amplitude.com/*", "*://*.segment.com/*", "*://*.hotjar.com/*",
+               "*://*.clarity.ms/*", "*://*.newrelic.com/*", "*://*.adobedtm.com/*",
+               "*://*.typekit.net/*", "*://*.gstatic.com/*", "*://*.chairsni.se/*"]
+
+
+def with_session(proxy, session):
+    """同一个代理账号换个 session 参数就是另一个住宅 IP（LinkUp 实测：
+    ...-session-a1b2c3 → 47.141.187.7，...-session-d4e5f6 → 73.137.13.162）。
+    写一次 URL 就能一直换，不用另外买账号、也不额外按次收费。"""
+    value = str(proxy or "").strip()
+    if not value or "@" not in value:
+        return value
+    parsed = urllib.parse.urlsplit(value if "://" in value else "http://" + value)
+    user = urllib.parse.unquote(parsed.username or "")
+    if not user:
+        return value
+    if "{session}" in user:
+        return value
+    if "session-" in user:
+        new_user = re.sub(r"session-[0-9a-zA-Z]{1,32}", "session-" + session, user)
+    else:
+        new_user = f"{user}-session-{session}"
+    pw = urllib.parse.quote(parsed.password or "", safe="")
+    host = parsed.hostname
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return f"{parsed.scheme or 'http'}://{urllib.parse.quote(new_user, safe='')}:{pw}@{host}"
+
 
 # homes.com 的州页 slug 就是州名小写；加上 DC 共 51 个入口
 US_STATES = [
@@ -189,8 +231,12 @@ class Gate:
         await asyncio.sleep(random.uniform(0, self.jitter))
 
 
-async def _load(tab, url, wait, tries, gate, stop):
-    """取一页。挑战页不算被拦：原地等它自己 reload（实测 4~25 秒），最多 tries 次。"""
+async def _load(tab, url, wait, tries, gate, stop, st=None):
+    """取一页。挑战页不算被拦：原地等它自己 reload（实测 4~25 秒），最多 tries 次。
+
+    连续被硬拒绝到 st["rotate_after"] 次就不再干等冷却——同一个出口 IP 等下去也不会通，
+    直接举旗让上层重开浏览器换 session（= 换出口 IP）。
+    """
     html = ""
     for attempt in range(tries):
         if stop is not None and stop.is_set():
@@ -207,9 +253,16 @@ async def _load(tab, url, wait, tries, gate, stop):
         html = await tab.get_content()
         if not blocked(html) and len(html) > 60000:
             gate.pass_()
+            if st is not None:
+                st["block_streak"] = 0
             return html
         if blocked(html):
             gate.trip()
+            if st is not None:
+                st["block_streak"] += 1
+                if st["block_streak"] >= st["rotate_after"]:
+                    st["rotate"].set()
+                    return html
             await asyncio.sleep(3 + attempt * 4)
             continue
         # 没到 6 万字节又不是硬拒绝 = 挑战页或还在渲染，等它自己过，不 trip
@@ -333,9 +386,26 @@ def _set_cursor(slug, page):
                         (page, now, slug))
 
 
+async def _lite_tab(tab):
+    """目录页只要 HTML 就能出人，图片/CSS/字体/JS 全是白烧的流量和白送的请求数。"""
+    from nodriver.cdp import network as nw
+    try:
+        await tab.send(nw.set_blocked_ur_ls(
+            [nw.BlockPattern(url_pattern=p, block=True) for p in _LITE_BLOCK]))
+        return True
+    except Exception:
+        return False
+
+
 async def _worker(slot, browser, queue, progress_cb, st, stop, wait, pace,
-                  drop_female, discover):
+                  drop_female, discover, lite=True):
     tab = await browser.get("about:blank", new_tab=True)
+    if lite:
+        ok = await _lite_tab(tab)
+        if not ok and not st["lite_warned"]:
+            st["lite_warned"] = True
+            progress_cb("⚠ 屏蔽子资源没挂上（这台机器的浏览器不认 CDP 规则），"
+                        "这一轮会连图片脚本一起拉，多花流量")
     while not stop.is_set():
         try:
             item = queue.get_nowait()
@@ -368,11 +438,16 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
     blocked_out = stopped = invalid = stuck = empty_out = False
     new_slugs = set()
     while page <= MAX_PAGE and not stop.is_set():
-        html = await _load(tab, slug_url(slug, page), wait, 6, st["gate"], stop)
+        html = await _load(tab, slug_url(slug, page), wait, 6, st["gate"], stop, st)
         if html is None:
             stopped = True
             break
         if blocked(html):
+            if st["rotate"].is_set():
+                # 这个出口 IP 已经废了，别把它记成 failed，回队尾等下一个 IP
+                _set_slug_status(slug, "pending", pages_total, found, saved, page=page)
+                stopped = True
+                break
             st["blocks"] += 1
             _set_slug_status(slug, "failed", pages_total, found, saved, page=page)
             blocked_out = True
@@ -446,10 +521,14 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
         st["slugs_total"] += added
         st["new_slugs"] += added
     st["slugs_done"] += 1
+    resumed = stopped or stuck or empty_out
     if stopped:
         _set_slug_status(slug, "pending", pages_total, found, saved, page=page)
     elif not (blocked_out or invalid or stuck or empty_out):
         _set_slug_status(slug, "done", pages_total, found, saved, page=1)
+    if resumed and st["rotate"].is_set():
+        # 这一轮是被"换出口 IP"打断的，活儿得还给队列，下一轮新 IP 接着跑
+        st["queue"].put_nowait((slug, page))
     note = (f" | 进度 {st['slugs_done']}/{st['slugs_total']} "
             f"新发现{added}个地区 队列剩{st['queue'].qsize()}")
     if stopped:
@@ -479,65 +558,147 @@ async def _heartbeat(st, progress_cb, stop, started):
         await asyncio.sleep(60)
         mins = (time.monotonic() - started) / 60 or 1
         rate = st["agents"] / mins
+        mb = st["mb"] + (st["relay"].bytes_transferred / 1e6 if st["relay"] else 0)
         left = st["gate"].until - time.monotonic()
         cool = f" 冷却中{left:.0f}s" if left > 0 else ""
         progress_cb(f"心跳: 地区 {st['slugs_done']}/{st['slugs_total']} "
                     f"页{st['pages']} 存{st['agents']}人（有号{st['phones']} 无号{st['nophone']}）"
                     f" {rate:.1f}人/分 并发{len(st['inflight'])}个{cool} "
                     f"硬拒绝{st['blocks']}次 挑战没过{st['challenges']}次 空页{st['empties']}次 "
-                    f"退避{st['gate'].trips}次 新地区{st['new_slugs']}个")
+                    f"退避{st['gate'].trips}次 换出口IP{st['exits']}次 新地区{st['new_slugs']}个 "
+                    f"过代理{mb:.0f}MB")
+
+
+class _RoundStop:
+    """一轮 = 一个浏览器 = 一个出口 IP。用户点停止或被判定该换 IP 都算这一轮结束。"""
+
+    def __init__(self, user_stop, rotating):
+        self.user_stop = user_stop
+        self.rotating = rotating
+
+    def is_set(self):
+        return self.user_stop.is_set() or self.rotating.is_set()
 
 
 async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
-                     discover, drop_female, proxy, proxy_pass):
+                     discover, drop_female, proxy, proxy_pass, rotate_ip, lite,
+                     rotate_after=6):
     exe = find_browser()
     if not exe:
         raise RuntimeError("既没在本机找到 Chrome/Edge/Brave，交付文件夹里的 browser 目录"
                            "也没有自带的 Chromium，起不了浏览器。在「抓取设置 → 浏览器路径」"
                            "里手动指一个（查过 " + describe_search() + "）")
     progress_cb(f"浏览器：{exe}（{browser_kind(exe)}）")
-    relay = None
-    args = []
-    if proxy.strip():
-        try:
-            relay = start_relay(proxy, proxy_pass, "%06x" % random.getrandbits(24))
-        except Exception as e:
-            raise RuntimeError(f"代理填法不对：{e}（该写 http://user:pass@host:port）")
-        args = [f"--proxy-server={relay.server}"]
-        progress_cb(f"出口：走代理 {relay.server}（本地中继补认证）")
-    else:
-        progress_cb("出口：本机直连。实测本机（泰国）直连 homes.com 已被边缘 403，"
-                    "连 robots.txt 都拒，建议填美国住宅代理")
-    browser = await uc.start(headless=False, browser_executable_path=exe,
-                             sandbox=not is_bundled(exe), browser_args=args)
     queue = asyncio.Queue()
     items = queue_items(slugs)
     for item in items:
-        queue.put_nowait(item)
-    st = {"browser": browser, "queue": queue, "seen": known_keys(), "slugs_done": 0,
+        queue.put_nowait((item[0], item[1]))
+    st = {"browser": None, "queue": queue, "seen": known_keys(), "slugs_done": 0,
           "slugs_total": len(items), "agents": 0, "phones": 0, "nophone": 0,
           "pages": 0, "blocks": 0, "challenges": 0, "empties": 0, "new_slugs": 0,
           "queued": {s for s, _ in items},
-          "inflight": set(), "cursor": {}, "gate": Gate()}
-    await _warm_up(browser, progress_cb, stop)
-    started = time.monotonic()
-    beat = asyncio.ensure_future(_heartbeat(st, progress_cb, stop, started))
+          "inflight": set(), "cursor": {}, "gate": Gate(),
+          "rotate": asyncio.Event(), "block_streak": 0,
+          "rotate_after": rotate_after if (proxy.strip() and rotate_ip) else 1 << 30,
+          "exits": 0, "dead_rounds": 0, "agents_at_round_start": 0,
+          "lite_warned": False, "relay": None, "mb": 0.0}
     n_workers = max(1, int(concurrency))
+    if proxy.strip():
+        how = "被连续硬拒绝就重开浏览器换出口 IP" if rotate_ip else "出口 IP 固定不换"
+    else:
+        how = "本机直连，没有第二个出口 IP 可换"
     progress_cb(f"引擎就绪：并发 {n_workers} 个标签页，"
                 f"{'自动发现下级地区' if discover else '只跑给定地区'}，"
-                f"{'剔除女性姓名' if drop_female else '男女都留'}")
-    try:
-        tasks = [_worker(i, browser, queue, progress_cb, st, stop, wait, pace,
-                         drop_female, discover) for i in range(n_workers)]
-        await asyncio.gather(*tasks, return_exceptions=True)
-    finally:
-        beat.cancel()
+                f"{'剔除女性姓名' if drop_female else '男女都留'}，{how}，"
+                f"{'不拉图片样式' if lite else '图片样式照拉'}")
+    started = time.monotonic()
+    rnd_no = 0
+    while not stop.is_set():
+        rnd_no += 1
+        st["rotate"].clear()
+        st["block_streak"] = 0
+        relay = None
+        args = []
+        if proxy.strip():
+            sid = "%06x" % random.getrandbits(24)
+            try:
+                relay = start_relay(with_session(proxy, sid), proxy_pass, sid)
+            except Exception as e:
+                raise RuntimeError(f"代理填法不对：{e}（该写 http://user:pass@host:port）")
+            args = [f"--proxy-server={relay.server}"]
+            progress_cb(f"出口：走代理（本地中继补认证，session={sid}）"
+                        if rnd_no == 1 else f"♻ 第{rnd_no}轮换出口 IP（session={sid}）")
+        else:
+            progress_cb("出口：本机直连（实测泰国出口已被 homes.com 边缘 403，"
+                        "连 robots.txt 都拒；被拦只能停手等回血）"
+                        if rnd_no == 1 else f"♻ 第{rnd_no}轮重开浏览器再试（还是本机出口）")
+        browser = await uc.start(headless=False, browser_executable_path=exe,
+                                 sandbox=not is_bundled(exe), browser_args=args)
+        st["browser"] = browser
+        st["relay"] = relay
+        rnd = _RoundStop(stop, st["rotate"])
+        await _warm_up(browser, progress_cb, rnd)
+        beat = asyncio.ensure_future(_heartbeat(st, progress_cb, rnd, started))
         try:
-            browser.stop()
-        except Exception:
-            pass
-        if relay:
-            relay.stop()
+            tasks = [_worker(i, browser, queue, progress_cb, st, rnd, wait, pace,
+                             drop_female, discover, lite) for i in range(n_workers)]
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            beat.cancel()
+            st["relay"] = None
+            if relay:
+                st["mb"] += relay.bytes_transferred / 1e6
+            try:
+                browser.stop()
+            except Exception:
+                pass
+            if relay:
+                relay.stop()
+        if stop.is_set() or not st["rotate"].is_set():
+            break
+        if proxy.strip() and not rotate_ip:
+            break
+        if queue.empty():
+            # 举了旗但没活儿了（被中断的地区都已回队列）→ 收工
+            break
+        # 换了 IP 一个人还是抢不到 = 不是某个 IP 的问题（代理到期/账号被打标），
+        # 继续换就是白烧流量，到点收手。
+        if st["agents"] == st.get("agents_at_round_start"):
+            st["dead_rounds"] += 1
+        else:
+            st["dead_rounds"] = 0
+        st["agents_at_round_start"] = st["agents"]
+        if proxy.strip() and st["dead_rounds"] >= 8:
+            progress_cb(f"⚠ 连换 {st['exits']} 个出口 IP 都一个人没抢到，先停手。"
+                        "这不是单个 IP 的问题（多半是代理账号到期/被打标），"
+                        "再换下去只是白烧流量")
+            break
+        st["exits"] += 1
+        if proxy.strip():
+            await asyncio.sleep(2)
+            continue
+        # 直连只有本机这一个出口 IP，换不了 —— 硬撞只会把封窗口越拖越长
+        # （实测 1 个标签页撞 700 秒：0 页 0 人，退避从 2 次涨到 7 次）。
+        if st["exits"] >= 4:
+            progress_cb("⚠ 直连重开 4 轮浏览器还是进不去，先停在这里。"
+                        "过几小时再点开始（会接着上次那页跑），或填上代理出口")
+            break
+        nap = 300 * st["exits"]
+        progress_cb(f"⚠ 直连被硬拒绝且没有第二个出口 IP → 停 {nap//60} 分钟再重开浏览器试探"
+                    f"（期间一个请求都不发，不烧流量）")
+        left = nap
+        while left > 0 and not stop.is_set():
+            await asyncio.sleep(min(15, left))
+            left -= 15
+    mins = (time.monotonic() - started) / 60 or 1
+    if proxy.strip():
+        progress_cb(f"过代理流量合计 {st['mb']:.0f}MB：{st['pages']}页 → "
+                    f"每页 {st['mb'] * 1000 / max(1, st['pages']):.0f}KB；"
+                    f"新增 {st['agents']}人 → 每人 {st['mb'] * 1000 / max(1, st['agents']):.0f}KB"
+                    f"（用时 {mins:.0f} 分钟）")
+    else:
+        progress_cb(f"本机直连不计流量：{st['pages']}页 / 新增{st['agents']}人"
+                    f"（用时 {mins:.0f} 分钟）")
 
 
 async def _warm_up(browser, progress_cb, stop):
@@ -568,7 +729,8 @@ async def _warm_up(browser, progress_cb, stop):
 
 
 def run_batch(slugs, concurrency=6, progress_cb=None, stop=None, wait=6.0, pace=0.4,
-              discover=True, drop_female=True, proxy="", proxy_pass=""):
+              discover=True, drop_female=True, proxy="", proxy_pass="",
+              rotate_ip=True, lite=True):
     """在后台线程里调用；1 个浏览器 + concurrency 个标签页。"""
     slugs = [s.strip().lower().strip("/") for s in dict.fromkeys(slugs)
              if re.match(r"^[a-z0-9][a-z0-9\-]{1,70}$", s.strip().lower().strip("/"))]
@@ -590,7 +752,8 @@ def run_batch(slugs, concurrency=6, progress_cb=None, stop=None, wait=6.0, pace=
     try:
         loop.run_until_complete(_run_async(
             slugs, int(concurrency), safe_cb, stop, float(wait), float(pace),
-            bool(discover), bool(drop_female), str(proxy or ""), str(proxy_pass or "")))
+            bool(discover), bool(drop_female), str(proxy or ""), str(proxy_pass or ""),
+            bool(rotate_ip), bool(lite)))
     finally:
         loop.close()
     return len(slugs)
