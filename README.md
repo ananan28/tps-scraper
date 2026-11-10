@@ -36,6 +36,7 @@
 | `app_ui.py` | TPS 主用版界面（带可调阈值），入口就是它 |
 | `realtor_engine.py` / `app_realtor.py` | realtor.com 引擎 + 界面 |
 | `homes_engine.py` / `app_homes.py` | homes.com 引擎 + 界面 |
+| `browser_path.py` | 本机 Chrome/Edge 定位（注册表 App Paths → 常见安装目录 → PATH）。nodriver 自带的探测只翻环境变量，打包到别的机器上会直接报 "could not find chrome browser binary"，两个 nodriver 引擎都改成显式传 `browser_executable_path` |
 | `build_ui.py` / `build_realtor.py` / `build_homes.py` | 各自打 Windows 免安装 EXE，产物落在 `dist_*` |
 | `build_mac.py` + `打包Mac.command` + `.github/workflows/build-mac.yml` | mac 端 `.app`：Windows 交叉打不出来，靠 GitHub Actions 在 mac runner 上构建 |
 | `copy_to_usb.py` | 把 `TPS_v1.8.2_UI` 整包拷 U 盘，数据库走 SQLite backup API 做一致快照（不会拷到半截的 `-wal`） |
@@ -65,7 +66,7 @@
 
 历史打包件 `TPS_v1.8.2\` `TPS_v2.1.6\` `TPS_v2.1.7\` `TPS抓取器-macOS\` 已于 2026-11-10 清掉（里面只有几十条测试数据，EXE 可用 `build*.py` 重打，mac 端由 GitHub Actions 自动出 `.app`）。桌面只留 `TPS_v1.8.2_UI\` 一份成品。
 
-## 三、绝不入库的东西
+## 四、绝不入库的东西
 
 `.gitignore` 已经把这几类挡掉了，别手动 `git add -f`：
 
@@ -77,7 +78,7 @@
 
 代理、2Captcha Key 一律在界面里填，代码和文档里不出现真实账号。
 
-## 四、部署步骤（以 homes 为例）
+## 五、部署步骤（以 homes 为例）
 
 1. 装依赖：`pip install -r requirements.txt`
 2. 打包：`python build_homes.py`（约 80 秒，产物在 `dist_homes\homes经纪人抓取器\`）
@@ -88,7 +89,7 @@
 
 TPS 还多两步：填代理 + 2Captcha Key，并确认 `ms-playwright` 里的 Chromium 跟着拷过去了。
 
-## 五、消耗估算（TPS）
+## 六、消耗估算（TPS）
 
 ### CapSolver / 2Captcha
 - 每次验证约 $0.003，1000 次约 $3
@@ -103,7 +104,7 @@ TPS 还多两步：填代理 + 2Captcha Key，并确认 `ms-playwright` 里的 C
 
 realtor 和 homes 都不吃这两项：走本机直连、无验证码。代价是慢 —— 已经确定"慢点就慢点，省钱优先"。
 
-## 六、故障处理与已知坑
+## 七、故障处理与已知坑
 
 - 浏览器崩溃自动重启、断网自动重试、解码失败重试 3 次
 - **同一 IP 反复起停会被 Akamai / Kasada 越掐越紧**：一次长跑很顺，跑跑停停就掉速（homes 实测从 368 人/分 掉到 7 人/分）。正式跑请单开一个长会话。
@@ -111,9 +112,10 @@ realtor 和 homes 都不吃这两项：走本机直连、无验证码。代价�
 - homes 的纯数字路径（如 `/33137/`）**不返回 404**，而是返回一个 24 人的通用搜索页；引擎按 canonical 识别这种兜底页并标为「无效地区」，不入库
 - realtor 直连并发超过 6 页会被硬封十几分钟
 - 拷贝正在使用的 SQLite 库之前**必须先 checkpoint**（`PRAGMA wal_checkpoint(TRUNCATE)`），只拷 `.db` 会丢掉还在 `-wal` 里的行
+- 目标机报 `could not find chrome browser binary` 时别再依赖 nodriver 自动探测：`browser_path.py` 会先查注册表 App Paths、再查常见安装目录和 PATH，Chrome 优先 Edge 兜底，显式传给 `uc.start(browser_executable_path=...)`；一个都没找到就在界面里明说"本机没装 Chrome/Edge"并列出查过的位置
 - TPS 抓到 0 号码基本只有一个原因：2Captcha 没额度，不是命中率低
 
-## 七、多电脑部署
+## 八、多电脑部署
 
 1. 打包 EXE 后整个文件夹拷到每台电脑
 2. 每台分不同地址段/地区段，避免重复劳动

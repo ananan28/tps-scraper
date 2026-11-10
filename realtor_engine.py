@@ -16,6 +16,7 @@ import nodriver as uc
 
 import engine_core as eng
 from engine_core import BASE, is_obvious_female, name_gender
+from browser_path import describe_search, find_browser
 
 DB_PATH = BASE / "realtor_data.db"
 REALTOR_HOST = "https://www.realtor.com"
@@ -260,9 +261,15 @@ class Lane:
         return [f"--proxy-server=127.0.0.1:{self.relay.port}"]
 
     async def start(self):
+        exe = find_browser()
+        if not exe:
+            raise RuntimeError("本机没找到 Chrome/Edge，起不了浏览器。装个 Chrome 再跑"
+                               "（查过 " + describe_search() + "）")
         args = self._args()
-        self.browser = (await uc.start(headless=False, browser_args=args)
-                        if args else await uc.start(headless=False))
+        kw = {"headless": False, "browser_executable_path": exe}
+        if args:
+            kw["browser_args"] = args
+        self.browser = await uc.start(**kw)
 
     async def do_rotate(self):
         """换新 session（新住宅 IP），浏览器实例重建。同一条通道上只允许一个人做。"""
