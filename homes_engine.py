@@ -392,18 +392,16 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
             invalid = True
             break
         cards = parse_cards(html)
-        if not cards:
-            # 能翻到空白页说明上一页是满的 48 张，这个地区大概率还有货，先重进两次
-            if page < (pages_total or page) and empty_try < 2:
+        if len(cards) < PER_PAGE and page < (pages_total or page):
+            # 不满 48 张不一定是尾页：网站会把页面截断渲染，先重进两次
+            if empty_try < 2:
                 empty_try += 1
                 await asyncio.sleep(wait + 2)
                 continue
-            if page < (pages_total or page):
-                # 重进完还是空：网站明明报了更多页，不能当抓完，排回队尾等下一轮
-                st["empties"] += 1
-                _set_slug_status(slug, "pending", pages_total, found, saved, page=page)
-                empty_out = True
-                break
+            # 重进完还是缺，而网站明明报了更多页 → 不能当抓完，排回队尾等下一轮
+            st["empties"] += 1
+            _set_slug_status(slug, "pending", pages_total, found, saved, page=page)
+            empty_out = True
             break
         empty_try = 0
         found += len(cards)
@@ -433,7 +431,7 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
         st["agents"] += len(fresh)
         st["phones"] += sum(1 for r in rows if r[0] in fresh and r[2])
         st["nophone"] += page_nop
-        if page >= pages_total or len(cards) < PER_PAGE:
+        if page >= (pages_total or 1):
             break
         page += 1
         await asyncio.sleep(pace)
@@ -466,8 +464,8 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
                     f"已排回队尾不算失败{note}")
         return
     if empty_out:
-        progress_cb(f"↪ {slug}: 第{page}页空卡片但网站说有{pages_total}页，重进2次还是空 "
-                    f"→ 已存{saved}人，排回队尾下次从第{page}页续{note}")
+        progress_cb(f"↪ {slug}: 第{page}页只有{len(cards)}张卡（网站说有{pages_total}页），"
+                    f"重进2次还是缺 → 已存{saved}人，排回队尾下次从第{page}页续{note}")
         return
     if invalid:
         progress_cb(f"⚠ {slug}: 不是地区专页（网站返回通用搜索页）→ 存0人{note}")
