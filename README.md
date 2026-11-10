@@ -59,11 +59,11 @@
 |---|---|
 | `Homes经纪人抓取器\` | homes.com 抓取器成品（最新，带兜底页校验） |
 | `Realtor经纪人抓取器\` | realtor.com 抓取器成品 |
-| `TPS_v1.8.2_UI\` | **TPS 主用版**：1.8.2 引擎 + 可调阈值界面，内置 Chromium（`ms-playwright`） |
-| `TPS_v1.8.2\` `TPS_v2.1.6\` `TPS_v2.1.7\` | TPS 历史版本，留着对比行为差异用 |
-| `TPS抓取器-macOS\` | mac 端打包用的 zip（`.app` 必须在 mac 上跑 `打包Mac.command` 生成，Windows 交叉打不出来） |
-| `phonedb\` | 号码库数据目录（不是软件） |
-| `tps-scraper\` | **就是这个仓库**：全部源码 + 本机正在用的三个库 + 备份 |
+| `TPS_v1.8.2_UI\` | **TPS 唯一在用版**：1.8.2 引擎 + 可调阈值界面，内置 Chromium（`ms-playwright`） |
+| `phonedb\` | 号码库数据目录（不是软件），源码在另一个仓库 [phonedb](https://github.com/ananan28/phonedb) |
+| `tps-scraper\` | **就是这个仓库**：全部源码 |
+
+历史打包件 `TPS_v1.8.2\` `TPS_v2.1.6\` `TPS_v2.1.7\` `TPS抓取器-macOS\` 已于 2026-11-10 清掉（里面只有几十条测试数据，EXE 可用 `build*.py` 重打，mac 端由 GitHub Actions 自动出 `.app`）。桌面只留 `TPS_v1.8.2_UI\` 一份成品。
 
 ## 三、绝不入库的东西
 
