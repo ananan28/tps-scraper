@@ -179,7 +179,26 @@ class Main(QMainWindow):
         hb.addWidget(btn_detect)
         g.addLayout(hb, row, 0, 1, 2)
         row += 1
-        tip = QLabel("本站不需要代理，也不用验证码；列表页就带电话，不进详情页。")
+        self.proxy_edit = QLineEdit()
+        self.proxy_edit.setPlaceholderText(
+            "http://USER:PASS@global.rp.linkup.onl:10000  （留空=本机直连）")
+        self.proxy_edit.setToolTip(
+            "2026-11-10 实测：本机（泰国出口）直连 homes.com 已经被边缘 403，"
+            "连 robots.txt 都取不到，必须从美国住宅 IP 出去。\n"
+            "写法支持两种：完整链接 http://user:pass@host:port，"
+            "或者只写用户名 + 下面单独填密码。\n"
+            "留空就按本机直连跑，日志里会打印当前出口 IP 让你核对。")
+        self.proxy_pass = QLineEdit()
+        self.proxy_pass.setEchoMode(QLineEdit.Password)
+        self.proxy_pass.setPlaceholderText("代理密码（单独填）")
+        pv = QHBoxLayout()
+        pv.addWidget(self.proxy_edit, 3)
+        pv.addWidget(self.proxy_pass, 1)
+        g.addWidget(QLabel("代理出口"), row, 0)
+        g.addLayout(pv, row, 1)
+        row += 1
+        tip = QLabel("列表页就带电话，不进详情页。目录页会先回一张 2.4KB 的挑战页，"
+                     "它自己 reload 后 4~25 秒变成真页面——新版引擎原地等它，不再误判成被拦。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#666")
         g.addWidget(tip, row, 0, 1, 2)
@@ -304,6 +323,8 @@ class Main(QMainWindow):
                 "discover": self.discover.isChecked(),
                 "drop_female": self.drop_female.isChecked(),
                 "browser_path": self.browser_edit.text().strip(),
+                "proxy": self.proxy_edit.text().strip(),
+                "proxy_pass": self.proxy_pass.text(),
             }), encoding="utf-8")
         except OSError:
             pass
@@ -319,6 +340,8 @@ class Main(QMainWindow):
         self.discover.setChecked(bool(c.get("discover", True)))
         self.drop_female.setChecked(bool(c.get("drop_female", True)))
         self.browser_edit.setText(str(c.get("browser_path", "")))
+        self.proxy_edit.setText(str(c.get("proxy", "")))
+        self.proxy_pass.setText(str(c.get("proxy_pass", "")))
         set_override(self.browser_edit.text())
 
     # ---------- browser ----------
@@ -409,9 +432,12 @@ class Main(QMainWindow):
         pace = float(self.pace.value())
         disc = self.discover.isChecked()
         female = self.drop_female.isChecked()
+        proxy = self.proxy_edit.text().strip()
+        proxy_pass = self.proxy_pass.text()
         self.save_config()
         self.log(f"启动：并发 {conc} 页，每页等 {wait:.0f}s，待处理 {len(slugs)} 个地区，"
-                 f"{'自动发现' if disc else '不发现'}，{'剔女' if female else '男女都留'}")
+                 f"{'自动发现' if disc else '不发现'}，{'剔女' if female else '男女都留'}，"
+                 f"{'走代理' if proxy else '本机直连'}")
 
         def cb(msg):
             self.bridge.log.emit(msg)
@@ -419,7 +445,8 @@ class Main(QMainWindow):
         def work():
             try:
                 eng.run_batch(slugs, concurrency=conc, progress_cb=cb, stop=self.stop_flag,
-                              wait=wait, pace=pace, discover=disc, drop_female=female)
+                              wait=wait, pace=pace, discover=disc, drop_female=female,
+                              proxy=proxy, proxy_pass=proxy_pass)
                 self.bridge.log.emit("全部完成" if not self.stop_flag.is_set() else "已停止")
             except Exception as e:
                 self.bridge.log.emit(f"运行出错: {e}")
