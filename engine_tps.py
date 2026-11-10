@@ -27,7 +27,7 @@ else:
     BASE = Path(__file__).resolve().parent
 DB_PATH = BASE / "tps_data.db"
 
-CAPSOLVER_API_URL = "https://api.capsolver.com"
+TWOCAPTCHA_API_URL = "https://2captcha.com"
 TURNSTILE_SITEKEY = "0x4AAAAAAAmywfqBst8n7ro5"
 TPS_HOST = "https://www.truepeoplesearch.com"
 PROXY_SERVER = "http://niceproxy.io:17521"
@@ -139,22 +139,6 @@ def stats():
     for key in ("pending", "running", "done", "failed"):
         out.setdefault(key, 0)
     return out
-
-
-def capsolver_balance():
-    """查 CapSolver 余额（美元），失败返回 None。"""
-    key = get_setting("capsolver", "")
-    if not key:
-        return None
-    try:
-        r = requests.post(f"{CAPSOLVER_API_URL}/getBalance",
-                          json={"clientKey": key}, timeout=10)
-        data = r.json()
-        if data.get("errorId") == 0:
-            return float(data.get("balance", 0))
-    except Exception:
-        pass
-    return None
 
 
 def clean_phone(phone):
@@ -359,31 +343,6 @@ def start_relay(proxy_template, proxy_pass, session):
     return LocalProxy(host, port, user, password)
 
 
-def capsolver_turnstile(page_url, api_key):
-    task = {"clientKey": api_key, "appVersion": "1.0.0",
-            "task": {"type": "AntiTurnstileTaskProxyLess", "websiteURL": page_url,
-                     "websiteKey": TURNSTILE_SITEKEY}}
-    try:
-        result = requests.post(f"{CAPSOLVER_API_URL}/createTask", json=task, timeout=30).json()
-    except Exception:
-        return None
-    if result.get("errorId") != 0:
-        return None
-    task_id = result["taskId"]
-    for _ in range(30):
-        time.sleep(2)
-        try:
-            result = requests.post(f"{CAPSOLVER_API_URL}/getTaskResult",
-                                   json={"clientKey": api_key, "taskId": task_id}, timeout=30).json()
-        except Exception:
-            return None
-        if result.get("status") == "ready":
-            return result["solution"]["token"]
-        if result.get("errorId") != 0:
-            return None
-    return None
-
-
 BLOCK_TITLE_MARKERS = ("just a moment", "attention required", "access denied",
                        "are you a robot", "verifying you are human", "ddos-guard",
                        "checking your browser", "rate limited", "too many requests",
@@ -430,33 +389,40 @@ def build_upstream_proxy(proxy_template, proxy_pass, session):
     return f"http://{user}:{proxy_pass}@{base.hostname}:{base.port or 80}"
 
 
-def capsolver_turnstile_proxied(page_url, upstream_proxy, api_key, action=None):
-    """带代理解 Turnstile：token 绑定我们的出口 IP。
+def twocaptcha_turnstile_proxied(page_url, upstream_proxy, api_key, action=None):
+    """2Captcha 带代理解 Turnstile：token 绑定我们的出口 IP。
     TPS 用 action='900' 渲染，必须带上否则服务端拒收。
     """
-    task_item = {"type": "AntiTurnstileTask", "websiteURL": page_url,
-                 "websiteKey": TURNSTILE_SITEKEY, "proxy": upstream_proxy}
+    parts = urllib.parse.urlsplit(upstream_proxy)
+    proxy_str = f"{parts.username or ''}:{parts.password or ''}@{parts.hostname or ''}:{parts.port or 80}"
+    params = {
+        "key": api_key,
+        "method": "turnstile",
+        "sitekey": TURNSTILE_SITEKEY,
+        "pageurl": page_url,
+        "proxy": proxy_str,
+        "proxytype": "http",
+        "json": "1",
+    }
     if action:
-        task_item["metadata"] = {"action": str(action)}
-    task = {"clientKey": api_key, "appVersion": "1.0.0", "task": task_item}
+        params["data-s"] = str(action)
     try:
-        result = requests.post(f"{CAPSOLVER_API_URL}/createTask", json=task, timeout=30).json()
+        result = requests.post(f"{TWOCAPTCHA_API_URL}/in.php", data=params, timeout=30).json()
     except Exception:
         return None
-    if result.get("errorId") != 0:
+    if result.get("status") != 1:
         return None
-    task_id = result["taskId"]
+    task_id = result["request"]
     for _ in range(40):
         time.sleep(2)
         try:
-            result = requests.post(f"{CAPSOLVER_API_URL}/getTaskResult",
-                                   json={"clientKey": api_key, "taskId": task_id}, timeout=30).json()
+            result = requests.get(f"{TWOCAPTCHA_API_URL}/res.php",
+                                  params={"key": api_key, "action": "get", "id": task_id, "json": "1"},
+                                  timeout=30).json()
         except Exception:
             return None
-        if result.get("status") == "ready":
-            return result["solution"]["token"]
-        if result.get("errorId") != 0:
-            return None
+        if result.get("status") == 1:
+            return result["request"]
     return None
 
 
@@ -481,8 +447,12 @@ async (token) => {
   try {
     const resp = await fetch(f.action, {method: 'POST', body: fd,
       headers: {'X-Requested-With': 'XMLHttpRequest'}});
-    const data = await resp.json();
-    return data;
+    const text = await resp.text();
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      return {success: false, reason: 'server returned HTML: ' + text.substring(0, 100)};
+    }
   } catch (e) {
     return {success: false, reason: String(e)};
   }
@@ -490,29 +460,36 @@ async (token) => {
 """
 
 
-def capsolver_cloudflare_proxied(page_url, upstream_proxy, api_key, html, user_agent):
-    """AntiCloudflareTask：解 Cloudflare 挑战页，返回 solution（含 cf_clearance）。"""
-    task = {"clientKey": api_key, "task": {
-        "type": "AntiCloudflareTask", "websiteURL": page_url,
-        "proxy": upstream_proxy, "userAgent": user_agent, "html": html}}
+def twocaptcha_cloudflare_proxied(page_url, upstream_proxy, api_key, html, user_agent):
+    """2Captcha Cloudflare 挑战页求解（Turnstile 方式），返回 {"token": ...}。"""
+    parts = urllib.parse.urlsplit(upstream_proxy)
+    proxy_str = f"{parts.username or ''}:{parts.password or ''}@{parts.hostname or ''}:{parts.port or 80}"
+    params = {
+        "key": api_key,
+        "method": "turnstile",
+        "sitekey": "0x4AAAAAAAAkg0s3VIW10P9P",
+        "pageurl": page_url,
+        "proxy": proxy_str,
+        "proxytype": "http",
+        "json": "1",
+    }
     try:
-        r = requests.post(f"{CAPSOLVER_API_URL}/createTask", json=task, timeout=30).json()
+        r = requests.post(f"{TWOCAPTCHA_API_URL}/in.php", data=params, timeout=30).json()
     except Exception:
         return None
-    if r.get("errorId") != 0:
+    if r.get("status") != 1:
         return None
-    task_id = r["taskId"]
+    task_id = r["request"]
     for _ in range(60):
         time.sleep(2)
         try:
-            rr = requests.post(f"{CAPSOLVER_API_URL}/getTaskResult",
-                               json={"clientKey": api_key, "taskId": task_id}, timeout=30).json()
+            rr = requests.get(f"{TWOCAPTCHA_API_URL}/res.php",
+                              params={"key": api_key, "action": "get", "id": task_id, "json": "1"},
+                              timeout=30).json()
         except Exception:
             return None
-        if rr.get("status") == "ready":
-            return rr.get("solution") or {}
-        if rr.get("errorId") != 0:
-            return None
+        if rr.get("status") == 1:
+            return {"token": rr["request"]}
     return None
 
 
@@ -554,11 +531,11 @@ def try_solve_challenge(page, upstream_proxy, api_key, origin_url=None, log=None
             return False
         action = info.get("action")
         _log(f"    TPS 验证码表单 action={action}，开始解...")
-        token = capsolver_turnstile_proxied(page.url, upstream_proxy, api_key, action=action)
+        token = twocaptcha_turnstile_proxied(page.url, upstream_proxy, api_key, action=action)
         if not token:
-            _log("    CapSolver 未返回 token")
+            _log("    2Captcha 未返回 token")
             return False
-        _log("    拿到 token，提交 captchaToken...")
+        _log(f"    拿到 token ({len(token)} chars)，提交 captchaToken...")
         try:
             data = page.evaluate(SUBMIT_CAPTCHA_JS, token)
         except Exception as exc:
@@ -583,7 +560,7 @@ def try_solve_challenge(page, upstream_proxy, api_key, origin_url=None, log=None
         html = page.content()
     except Exception:
         return False
-    sol = capsolver_cloudflare_proxied(page.url, upstream_proxy, api_key, html, UA)
+    sol = twocaptcha_cloudflare_proxied(page.url, upstream_proxy, api_key, html, UA)
     if not sol:
         _log("    Cloudflare 解失败")
         return False
@@ -748,9 +725,20 @@ def scrape_detail(page, person, address, now):
         clean, _dt = page_status(page)
         if not clean:
             up = getattr(scrape_detail, "upstream_proxy", None)
-            if up and try_solve_challenge(page, up, scrape_detail.capsolver_key, origin_url=detail_url, log=getattr(scrape_detail, "progress", None)):
+            prog = getattr(scrape_detail, "progress", None)
+            low_dt = (_dt or "").lower()
+            # 被拦就解（同 1.8.2）；限流页解不了，直接判定失败
+            can_solve = (up and getattr(scrape_detail, "solve_captcha", True)
+                         and "rate limit" not in low_dt and "too many" not in low_dt)
+            if can_solve and try_solve_challenge(page, up, scrape_detail.capsolver_key,
+                                                 origin_url=detail_url, log=prog):
                 clean, _dt = page_status(page)
             if not clean:
+                if prog:
+                    try:
+                        prog(f"    详情被拦({(_dt or 'blocked')[:30]})，跳过此人")
+                    except Exception:
+                        pass
                 return None, 0
 
         try:
@@ -808,8 +796,10 @@ def scrape_detail(page, person, address, now):
 
 
 def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_id=0,
-                    max_pages=10, progress_cb=None, max_attempts=12):
+                    max_pages=10, progress_cb=None, max_attempts=12, solve_captcha=True):
     """处理一个地址：列表页（含翻页）→ 每个人详情页取电话。
+    solve_captcha=True（默认，同 1.8.2）：被拦就解验证码，号码才能拿到。
+    solve_captcha=False：被拦直接换 IP（快但详情页大概率拿不到号码）。
     progress_cb(msg_str) 可选，用于实时回报进度。
     """
     def _progress(msg):
@@ -821,6 +811,7 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
 
     url = build_url(address)
     scrape_detail.capsolver_key = capsolver_key
+    scrape_detail.solve_captcha = solve_captcha
     scrape_detail.progress = _progress
     _progress(f"[W{worker_id}] 开始: {address[:40]}")
     with connect() as con:
@@ -907,13 +898,18 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                     clean, title = page_status(page)
                     last_title = title
                     if not clean:
-                        _progress(f"[W{worker_id}] 被拦({(title or 'challenge')[:30]})，尝试解验证码...")
-                        if try_solve_challenge(page, upstream_proxy, capsolver_key, log=_progress):
-                            clean, title = page_status(page)
-                            _progress(f"[W{worker_id}] 验证码通过，继续采集")
+                        low_t = (title or "").lower()
+                        # 限流页解不了，别浪费验证码，直接换 IP
+                        solvable = (solve_captcha and capsolver_key
+                                    and "rate limit" not in low_t and "too many" not in low_t)
+                        if solvable:
+                            _progress(f"[W{worker_id}] 被拦({(title or 'challenge')[:30]})，尝试解验证码...")
+                            if try_solve_challenge(page, upstream_proxy, capsolver_key, log=_progress):
+                                clean, title = page_status(page)
+                                _progress(f"[W{worker_id}] 验证码通过，继续采集")
                         if not clean:
                             last_error = f"blocked: {title or 'challenge'}"
-                            _progress(f"[W{worker_id}] 解不出/换 IP 重试")
+                            _progress(f"[W{worker_id}] 被拦({(title or 'challenge')[:24]})，换 IP 重试")
                             browser.close()
                             continue
 

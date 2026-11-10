@@ -1,6 +1,11 @@
 # 运行产物 / 大文件 / 数据 / 凭据，绝不入库
 dist/
+dist_homes/
+dist_realtor/
 build/
+build_homes/
+build_realtor/
+build_ui/
 __pycache__/
 *.pyc
 *.spec
@@ -23,5 +28,16 @@ _*.py
 test_*.py
 # 数据导出/备份（含个人信息），绝不入库
 *.csv
-#  Windows 启动器（Mac 用 .command / .app）
-启动TPS.bat
+# 本机正在用的库、姓名库、运行时配置、历史备份 —— 全部只留在本地
+user_names.json
+*_config.json
+backup_*/
+dist*/
+backup_*/
+logs/
+# 界面保存的本机配置（可能含代理账号/密码、验证码 Key）
+*_config.json
+# 姓名判定库（45k 条，由本地工具生成，不入库）
+user_names.json
+# Windows 启动器（由 build_*.py 生成；Mac 用 .command / .app）
+启动*.bat
