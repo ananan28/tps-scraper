@@ -364,6 +364,7 @@ async def _worker(slot, browser, queue, progress_cb, st, stop, wait, pace,
 async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_female, discover):
     found = saved = known = fem = nop = dup = 0
     pages_total = 0
+    empty_try = 0
     blocked_out = stopped = invalid = stuck = False
     new_slugs = set()
     while page <= MAX_PAGE and not stop.is_set():
@@ -392,7 +393,13 @@ async def _do_slug(tab, st, slug, page, progress_cb, stop, wait, pace, drop_fema
             break
         cards = parse_cards(html)
         if not cards:
+            # 中间页返回 0 张卡片不一定是尾页，先重进两次
+            if pages_total and page < pages_total and empty_try < 2:
+                empty_try += 1
+                await asyncio.sleep(wait + 2)
+                continue
             break
+        empty_try = 0
         found += len(cards)
         st["pages"] += 1
         st["cursor"][slug] = page + 1
