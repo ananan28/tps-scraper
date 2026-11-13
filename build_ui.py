@@ -39,7 +39,9 @@ def main():
     print("[3/3] 复制用户姓名库 + 生成双击启动器...", flush=True)
     shutil.copy2(BASE / "user_names.json", DIST / "user_names.json")
     launcher = DIST / f"启动{NAME}.bat"
-    launcher.write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "%s.exe"\r\n' % NAME, encoding="gbk")
+    # newline="" 否则 Windows 会把 \n 再翻成 \r\n，出来一堆 \r\r\n
+    launcher.write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "' + NAME + '.exe"\r\n',
+                        encoding="gbk", newline="")
 
     print("完成！交付文件夹：", DIST, flush=True)
 

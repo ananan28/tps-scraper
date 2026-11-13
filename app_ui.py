@@ -574,7 +574,9 @@ class Main(QMainWindow):
                 pass
         try:
             self._log_fh.write("\n".join(batch) + "\n")
-            if time.time() - self._log_flushed > 1.0:
+            # 平时（一两条）立刻落盘，免得程序被强杀时日志啥也没留下；
+            # 刷屏的那几百条只 write 不 flush，这才是原来卡的地方
+            if len(batch) < 50 or time.time() - self._log_flushed > 1.0:
                 self._log_fh.flush()
                 self._log_flushed = time.time()
         except Exception:
