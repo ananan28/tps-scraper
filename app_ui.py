@@ -84,6 +84,11 @@ class Main(QMainWindow):
         # 统计查询丢给后台线程，UI 线程只负责把结果写进标签
         self._stats_busy = False
         self._stats_again = False
+        self._last_stats = {}
+        # 搜索框一个字一个字敲，不能每个字母查一次库，攒 350 毫秒再查
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self.load_addresses)
         self.build()
         self.refresh()
         self._stats_timer = QTimer(self)
@@ -281,6 +286,8 @@ class Main(QMainWindow):
             "   对不上就是引擎有问题，把日志截给我。\n"
             "4 收尾：「导出 CSV」拿号码；「导出未用地址」拿还剩的排队地址给另一台电脑接着跑；\n"
             "   「导出已用地址」拿已经跑过的（含失败的），换电脑时先删这批就不会重复劳动。\n"
+            "要删某一条地址：右边「地址管理」搜索框填路名/城市/邮编，筛出来点行选中再「删除选中」；\n"
+            "   要清一批就先用「筛选」选状态再「删除筛选出的」（删除都只删排队记录，已采的号码保留）。\n"
             "「⏸ 暂停」= 手里这一路跑完就不再派新地址，地址状态仍是未用，再点开始接着跑。\n"
             "「⏹ 停止」= 同上，但整批就此收工。\n"
             "「重试失败」= 把失败的排回未用队尾。\n"
@@ -446,6 +453,15 @@ class Main(QMainWindow):
                                      "「未用」= 还没跑过的地址，可以导出去给别的电脑跑。")
         self.filter_combo.currentIndexChanged.connect(self.load_addresses)
         bar.addWidget(self.filter_combo)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜地址关键词…")
+        self.search_input.setMaximumWidth(200)
+        self.search_input.setToolTip(
+            "地址有几万条时用它定位。填路名、城市或邮编都行，输入内容按原样匹配（不区分大小写）。\n"
+            "搜索和上面的「筛选」是叠加的：先筛状态、再按关键词；「删除筛选出的」也只删符合这两条的。")
+        self.search_input.textChanged.connect(self._on_search)
+        bar.addWidget(self.search_input)
 
         reload_btn = QPushButton("刷新列表")
         reload_btn.clicked.connect(self.load_addresses)
@@ -660,11 +676,33 @@ class Main(QMainWindow):
             pass
 
     # ---------------- 地址管理 ----------------
+    def _on_search(self, _text=""):
+        self._search_timer.start(350)
+
     def _filter_sql(self):
+        """状态筛选 + 关键词搜索叠在一起，返回 (WHERE 子句, 参数)。"""
+        conds, args = [], []
         key = self.filter_combo.currentData()
-        if not key or key == "all":
-            return "", []
-        return "WHERE status=?", [key]
+        if key and key != "all":
+            conds.append("status=?")
+            args.append(key)
+        kw = self.search_input.text().strip()
+        if kw:
+            # 按原样匹配：把 % _ \ 三个 LIKE 通配符转义掉，免得搜 "100_Main" 命中一堆
+            esc = kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            conds.append("address LIKE ? ESCAPE '\\'")
+            args.append("%" + esc + "%")
+        return ("WHERE " + " AND ".join(conds)) if conds else "", args
+
+    def _filter_label(self):
+        parts = []
+        key = self.filter_combo.currentData()
+        if key and key != "all":
+            parts.append(f"「{self.filter_combo.currentText()}」")
+        kw = self.search_input.text().strip()
+        if kw:
+            parts.append(f"含「{kw}」")
+        return " ".join(parts) or "全部"
 
     def load_addresses(self):
         where, args = self._filter_sql()
@@ -693,8 +731,27 @@ class Main(QMainWindow):
             err = QTableWidgetItem((r["error"] or "")[:60])
             err.setToolTip(r["error"] or "")
             self.addr_table.setItem(i, 7, err)
-        more = f"（表里只列最新 {self.TABLE_LIMIT} 条，用「筛选」缩小范围）" if total > len(rows) else ""
-        self.addr_count_lbl.setText(f"显示 {len(rows)} / 共 {total} 条{more}")
+        if self.search_input.text().strip() or (self.filter_combo.currentData() or "all") != "all":
+            self.addr_count_lbl.setText(f"显示 {len(rows)} / 命中 {total} 条 · 条件：{self._filter_label()}"
+                                        + (f"（只列最新 {self.TABLE_LIMIT} 条）" if total > len(rows) else ""))
+        else:
+            more = f"（共 {total} 条，表里只列最新 {self.TABLE_LIMIT} 条）" if total > len(rows) else ""
+            self.addr_count_lbl.setText(f"显示 {len(rows)} / 共 {total} 条{more}")
+
+    def refresh_in_place(self):
+        """跑动中自动刷状态用：保住滚动位置，别把用户正看的那一屏弹回顶部。"""
+        pos = self.addr_table.verticalScrollBar().value()
+        self.load_addresses()
+        self.addr_table.verticalScrollBar().setValue(pos)
+
+    def _still_pending(self, address):
+        """派活前再核对一次：排队期间被删掉/被改成别的状态的地址，不要再为它开浏览器烧流量。"""
+        try:
+            with eng.connect() as con:
+                return con.execute("SELECT 1 FROM addresses WHERE address=? AND status='pending'",
+                                   (address,)).fetchone() is not None
+        except Exception:
+            return True
 
     def _selected_ids(self):
         ids = []
@@ -725,9 +782,8 @@ class Main(QMainWindow):
         self.refresh()
 
     def delete_filtered(self):
-        key = self.filter_combo.currentData()
         where, args = self._filter_sql()
-        label = self.filter_combo.currentText()
+        label = self._filter_label()
         try:
             with eng.connect() as con:
                 total = con.execute(f"SELECT COUNT(*) FROM addresses {where}", args).fetchone()[0]
@@ -735,11 +791,11 @@ class Main(QMainWindow):
             self.log(f"统计失败: {e}")
             return
         if not total:
-            QMessageBox.information(self, "删除", f"「{label}」这一类没有地址。")
+            QMessageBox.information(self, "删除", f"符合条件的地址 0 个（条件：{label}）。")
             return
         reply = QMessageBox.question(
             self, "确认删除",
-            f"要删除「{label}」全部 {total} 个地址。\n"
+            f"要删除 条件「{label}」下的全部 {total} 个地址。\n"
             f"（只删地址排队记录，已采到的号码结果保留）\n\n建议先点「导出未用地址」或「导出已用地址」留个底。",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
@@ -887,6 +943,7 @@ class Main(QMainWindow):
                 # 队列式调度：只保持并发数那么多在跑，完成一个补一个（支持暂停）
                 # 线程池按并发数的 2 倍预留（改大并发时不用重开），最多 128 路
                 pool_cap = min(128, max(16, concurrency * 2))
+                dropped = 0
                 with ThreadPoolExecutor(max_workers=pool_cap, thread_name_prefix="tps") as executor:
                     futures = {}
                     idx = 0
@@ -896,6 +953,9 @@ class Main(QMainWindow):
                         limit = min(max(1, self._concurrency), pool_cap)
                         while self.running and len(futures) < limit and queue:
                             addr = queue.popleft()
+                            if not self._still_pending(addr):
+                                dropped += 1
+                                continue
                             future = executor.submit(
                                 eng.process_address, addr, proxy, proxy_pass, capsolver,
                                 worker_id=idx, progress_cb=on_progress,
@@ -933,6 +993,9 @@ class Main(QMainWindow):
                             except Exception as e:
                                 self.bridge.log.emit(f"错误 {url[:34]}：{e}")
 
+                    if dropped:
+                        self.bridge.log.emit(f"其中 {dropped} 个地址在排队期间已被删除/改状态，"
+                                             f"没有为它们开浏览器")
                     if not self.running:
                         self.bridge.log.emit("已暂停（当前任务已完成，点击开始继续）")
                     else:
@@ -1053,6 +1116,9 @@ class Main(QMainWindow):
             self.runtime_lbl.setText("00:00:00")
             self.hourly_lbl.setText("0 地址/小时")
             self.phone_speed_lbl.setText("0 电话/分钟")
+        # 跑动中让地址表跟着状态变；正选着行就不动，免得打断手头的多选
+        if self.running and not self.addr_table.selectionModel().hasSelection():
+            self.refresh_in_place()
         if self._stats_again:
             self._stats_again = False
             self.refresh()
