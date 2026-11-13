@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
-NAME = "TPS抓取器"
+NAME = "新2.0版本"
 DIST = BASE / "dist_ui" / NAME
 
 
@@ -38,8 +38,8 @@ def main():
 
     print("[3/3] 复制用户姓名库 + 生成双击启动器...", flush=True)
     shutil.copy2(BASE / "user_names.json", DIST / "user_names.json")
-    launcher = DIST / "启动TPS.bat"
-    launcher.write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "TPS抓取器.exe"\r\n', encoding="gbk")
+    launcher = DIST / f"启动{NAME}.bat"
+    launcher.write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "%s.exe"\r\n' % NAME, encoding="gbk")
 
     print("完成！交付文件夹：", DIST, flush=True)
 
