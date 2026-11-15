@@ -75,7 +75,14 @@ def mount(group, inner_layout):
     box.setContentsMargins(2, 0, 2, 2)
     box.addWidget(holder)
     holder.setVisible(group.isChecked())
-    group.toggled.connect(holder.setVisible)
+
+    def _toggle(on):
+        holder.setVisible(on)
+        # 光 setVisible 不够：外层布局不会重算，框子会继续占着展开时的 208px 空白。
+        # 实测补一句 updateGeometry() 后四个框才真降到 31px。
+        group.updateGeometry()
+
+    group.toggled.connect(_toggle)
     return holder
 
 
@@ -349,7 +356,9 @@ class Main(QMainWindow):
         mount(stats_group, stats_layout)
         left_layout.addWidget(stats_group)
 
-        left_layout.addStretch()
+        # 末尾这条必须给 stretch=1：全是 0 时 Qt 把多余高度平均分给每个框，
+        # 取消勾选后框里的内容虽然藏了，框本身还占着 200 多 px 空白。
+        left_layout.addStretch(1)
 
         # 左栏定宽 + 可滚动：以前窗口一最大化，配置那几栏跟着被拉到 1900px 宽，
         # 一行说明直接被屏幕切掉；现在左栏最宽 680，窗口再宽也是日志吃多出来的空间。

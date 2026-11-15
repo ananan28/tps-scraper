@@ -227,7 +227,10 @@ bat 正文是 **GBK**、里面不加 `chcp`（这台机 ACP=936，加了 `chcp 6
 - 「配置 / 地址导入 / 控制 / 统计」四个勾选框是**真折叠**（`app_tps.py` 的 `mount(group, inner_layout)`）。
   PySide6 6.12 里 checkable 的 `QGroupBox` 取消勾选**不会**藏子控件（实测取消后子控件仍可见、高度一点没变），
   所以必须把内容装进一个 `QWidget` 容器、用 `toggled → setVisible` 才收得起来。
-  离屏实测：默认 473px、四段全展开 601px、全收起 160px。
+  两个坑都要踩：① 只 `setVisible(False)` 外层布局不重算，框子继续占着展开时的 208px 空白，
+  必须补 `group.updateGeometry()`；② 左栏末尾的 `addStretch()` 要给因子 1（`addStretch(1)`），
+  全为 0 时 Qt 把多余高度平均分给每个框，收起来照样一片空灰。
+  离屏实测四框高度：默认 437px、四段全展开 565px、全收起 124px（每框 31px）。
 - FPS 的「挪出屏幕」＝Chrome 窗口 `--window-position=-32000,-32000` 挪到屏幕外，**不是无头**
   （无头已判死：连换 3 个出口 IP 各等满 200 秒 0 张卡片）。同时加 `CalculateNativeWinOcclusion`
   等三个 flag，防止窗口看不见就被降频。
