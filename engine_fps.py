@@ -16,6 +16,7 @@ Playwright Chromium 两次各等满 180 秒都停在 886 字节挑战页、0 张
 - 被弹回首页 ≠ 无住户：必须换 IP 复测，换完还是首页才允许记无数据。
 """
 import asyncio
+import ctypes
 import html as htmlmod
 import os
 import re
@@ -73,6 +74,10 @@ BROWSER_ARGS = ["--no-first-run", "--no-default-browser-check",
                 "--disable-features=OptimizationHints,MediaRouter,Translate,"
                 "InterestFeedContentSuggestions,PrivacySandboxSettings4,"
                 "CalculateNativeWinOcclusion",
+                # 界面语言设成英文：站点是英文页，中文界面的 Chrome 会在屏幕左上角弹「翻译此页？」
+                # 小窗（实测挪出屏幕时 2 个地址弹出 11 个，--disable-features=Translate 压不住）。
+                # 英文界面 + 英文页面就不弹，顺带 navigator.language 也和美国出口 IP 更一致。
+                "--lang=en-US",
                 "--window-size=1024,768", "--mute-audio"]
 
 # 「隐藏窗口」= 把窗口挪到屏幕外面，不是无头。
@@ -353,8 +358,176 @@ def _chrome_candidates():
     return [x for x in out if not x or Path(x).exists()] or [""]
 
 
+STOPPING = False
+
+
+def begin_shutdown():
+    """界面正在关：从现在起一个浏览器都不许再开，免得收尾那几秒又冒出孤儿进程。"""
+    global STOPPING
+    STOPPING = True
+
+
+def _proc_table():
+    """一次进程快照 → {pid: (小写进程名, 父pid)}。非 Windows 回空表。"""
+    if os.name != "nt":
+        return {}
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_ssize_t
+    k32.Process32First.restype = ctypes.c_int
+    k32.Process32Next.restype = ctypes.c_int
+
+    class _E(ctypes.Structure):
+        # 布局必须和 Windows 的 PROCESSENTRY32W 一模一样：dwSize 后面还有 cntUsage，
+        # th32DefaultHeapID 是 ULONG_PTR（8 字节对齐把后面顶到偏移 44）。
+        # 少写 cntUsage 或按 CHAR*260 填，Process32First 会直接返回 0（实测遍历到 0 个进程）。
+        _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32),
+                    ("th32ProcessID", ctypes.c_uint32),
+                    ("th32DefaultHeapID", ctypes.c_void_p), ("th32ModuleID", ctypes.c_uint32),
+                    ("cntThreads", ctypes.c_uint32), ("th32ParentProcessID", ctypes.c_uint32),
+                    ("pcPriClassBase", ctypes.c_int), ("dwFlags", ctypes.c_uint32),
+                    ("szExeFile", ctypes.c_wchar * 260)]
+
+    h = k32.CreateToolhelp32Snapshot(0x2, 0)      # TH32CS_SNAPPROCESS
+    if h == -1:
+        return {}
+    out = {}
+    try:
+        e = _E()
+        e.dwSize = ctypes.sizeof(_E)
+        ok = k32.Process32FirstW(h, ctypes.byref(e))
+        while ok:
+            out[e.th32ProcessID] = ((e.szExeFile or "").lower(), e.th32ParentProcessID)
+            ok = k32.Process32NextW(h, ctypes.byref(e))
+    finally:
+        k32.CloseHandle(h)
+    return out
+
+
+def _browser_descendants(table, root_pid):
+    """返回 (root_pid 名下所有浏览器进程, 其中该立刻杀的「主进程」)。
+    root_pid 自己就是 Chrome 时也算进来 —— 引擎收尾时传的就是那台浏览器自己的 pid，
+    漏了它等于只杀子进程，主进程会把渲染进程重新拉起来。"""
+    kids = {}
+    for pid, (_n, par) in table.items():
+        kids.setdefault(par, []).append(pid)
+    found, heads, stack = [], [], [root_pid]
+    if table.get(root_pid, ("", 0))[0].startswith(("chrome", "chromium")):
+        found.append(root_pid)
+        heads.append(root_pid)
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            if table[c][0].startswith(("chrome", "chromium")):
+                found.append(c)
+                if table[c][1] == root_pid:
+                    heads.append(c)
+            stack.append(c)
+    return found, heads
+
+
+def browser_tree(root_pid):
+    """我名下（root_pid 往下）的所有浏览器进程 pid。
+    他自己双击开的 Chrome 父进程是 explorer，永远不在这棵树里 ⇒ 这个函数碰不到他的窗口。"""
+    return _browser_descendants(_proc_table(), root_pid)[0]
+
+
+def _terminate(pids):
+    k = ctypes.windll.kernel32
+    gone = 0
+    for pid in pids:
+        h = k.OpenProcess(0x0001, False, pid)         # PROCESS_TERMINATE
+        if not h:
+            continue
+        try:
+            if k.TerminateProcess(h, 1):
+                gone += 1
+        finally:
+            k.CloseHandle(h)
+    return gone
+
+
+def _alive(pid):
+    """进程断气了没（PROCESS_QUERY_LIMITED_INFORMATION + STILL_ACTIVE）。"""
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, pid)
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+            return True
+        return code.value == 259
+    finally:
+        k.CloseHandle(h)
+
+
+def kill_browser_tree(root_pid):
+    """收掉 root_pid 名下的浏览器进程。只按父子关系找，绝不按进程名满机器扫。
+    顺序必须「先杀 Chrome 主进程」：主进程还活着会不停把渲染/GPU 进程重新拉起来，
+    反过来由下往上杀就是打地鼠（实测杀 6 个反而又冒出 6 个）。
+    主进程断气后 Chrome 子进程自己会退，再补两轮扫荡收尾。返回清掉的个数。"""
+    if os.name != "nt":
+        return 0
+    k = ctypes.windll.kernel32
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    found, heads = _browser_descendants(_proc_table(), root_pid)
+    if not found:
+        return 0
+    _terminate(heads)                                  # 主进程先走
+    rest = [p for p in found if p not in set(heads)]
+    for _ in range(2):
+        if not rest:
+            break
+        time.sleep(0.3)
+        _terminate(rest)
+        rest = [p for p in rest if _alive(p)]
+    return len(found) - len(rest)
+
+
+async def _close_browser(browser, log=None):
+    """用完一个浏览器必须整棵树收掉。
+    以前这里只调 nodriver 的 browser.stop()：事件循环还活着时它能把 Chrome 收干净（实测），
+    但界面一关，工作线程是被解释器硬冻住的，finally 根本走不到 —— 11-16 实测他关掉界面之后
+    还有 84 个 chrome.exe / 5.9GB 挂在程序进程底下。所以这里不指望 stop()，
+    自己断开 CDP 再按 pid 把整棵 Chrome 收掉（含临时 profile）。"""
+    if browser is None:
+        return
+    pid = getattr(browser, "_process_pid", None)
+    try:
+        await asyncio.wait_for(browser.aclose(), timeout=3)
+    except Exception:
+        pass
+    if not pid:
+        try:
+            browser.stop()
+        except Exception:
+            pass
+        return
+    kill_browser_tree(pid)
+    try:
+        browser._process = None
+        browser._process_pid = None
+    except Exception:
+        pass
+    cfg = getattr(browser, "config", None)
+    if cfg is not None and not getattr(cfg, "uses_custom_data_dir", True):
+        import shutil
+
+        for _ in range(2):
+            try:
+                shutil.rmtree(cfg.user_data_dir)
+                break
+            except Exception:
+                await asyncio.sleep(0.2)
+
+
 async def _open_browser(relay, headless, log, hide=False):
     """一个尝试 = 一个出口 IP = 一个浏览器：换 IP 靠重开，不用同一个浏览器里换 session。"""
+    if STOPPING:
+        raise RuntimeError("程序正在关闭，不再开新浏览器")
     import nodriver as uc
     args = [f"--proxy-server={relay.server}"] + BROWSER_ARGS
     if hide and not headless:
@@ -516,11 +689,7 @@ async def _run_attempt(address, url, relay, opt):
     except Exception as exc:
         return "error", c, pending, f"{type(exc).__name__}: {exc}"
     finally:
-        if browser is not None:
-            try:
-                browser.stop()
-            except Exception:
-                pass
+        await _close_browser(browser, _log)
 
 
 def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_id=0,

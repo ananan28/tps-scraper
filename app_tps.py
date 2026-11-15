@@ -102,6 +102,7 @@ class Main(QMainWindow):
         self.bridge.refresh.connect(self.refresh)
         self.bridge.ui.connect(self._run_ui)
         self.running = False
+        self._closing = False
         self.workers = []
         self.start_time = None
         self._concurrency = int(eng.get_setting("concurrency", 5))
@@ -625,6 +626,25 @@ class Main(QMainWindow):
         """暂停：跑完当前地址后不再接新地址，可继续。"""
         self.running = False
         self.log("请求暂停（跑完当前地址后停止派发）...")
+
+    def closeEvent(self, ev):
+        """关窗口 = 程序真要走，得自己把浏览器收干净。
+        少了这一步：工作线程是 daemon，解释器收尾时它们正卡在浏览器里，engine 那层的
+        finally 根本跑不到 —— 11-16 实测他关掉界面之后还有 84 个 chrome.exe / 5.9GB
+        挂在程序进程底下，整机卡死就是这么来的。
+        只按父子关系收自己名下的浏览器；他自己双击开的 Chrome 挂在 explorer 底下，碰不到。"""
+        if self._closing:
+            ev.accept()
+            return
+        self._closing = True
+        self.running = False
+        self._stats_timer.stop()
+        eng_fps.begin_shutdown()
+        self._allow_sleep()
+        killed = eng_fps.kill_browser_tree(os.getpid())
+        if killed:
+            self.log(f"关闭：收掉 {killed} 个浏览器进程")
+        ev.accept()
 
     def clear_data(self):
         """清除已导出的结果数据（地址保留）。"""
