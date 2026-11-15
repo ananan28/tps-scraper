@@ -209,6 +209,43 @@ class Main(QMainWindow):
         g.addWidget(QLabel("出口轮换"), row, 0)
         g.addWidget(self.rotate_ip, row, 1)
         row += 1
+        self.ip_list = QPlainTextEdit()
+        self.ip_list.setPlaceholderText(
+            "一批 IP，一行一个（填了就优先按这个轮着查，上面「代理出口」留空即可）：\n"
+            "1.2.3.4:8080\n"
+            "5.6.7.8:8080:账号:密码\n"
+            "http://user:pass@9.9.9.9:3128")
+        self.ip_list.setToolTip(
+            "一轮浏览器 = 一条 IP（Akamai 要同一个实例从头到尾同一个出口 IP，token 才对得上），\n"
+            "被限流或连续硬拒就整个重开、换池里下一条接着跑；被限流的那条自己歇着（指数退避），\n"
+            "连续硬拒到次数直接停用，不再拿它白请求。\n"
+            "免认证的白名单型 IP 只写 IP:端口；带认证的写 四段 或 完整 http:// 链接。\n"
+            "这一栏只存在本机配置文件里，不会写进代码、也不会推到仓库。")
+        self.ip_list.setMaximumHeight(96)
+        g.addWidget(QLabel("IP 轮换池"), row, 0)
+        g.addWidget(self.ip_list, row, 1)
+        row += 1
+        self.ip_interval = QSpinBox()
+        self.ip_interval.setRange(0, 120)
+        self.ip_interval.setSuffix(" 秒")
+        self.ip_interval.setValue(8)
+        self.ip_interval.setToolTip(
+            "同一条 IP 两次上岗之间至少隔这么久（一轮只用一条，所以它就是「这条 IP 多久被查询一次」的下限）。\n"
+            "0 = 不限制，被限流才冷却。")
+        self.ip_switch = QSpinBox()
+        self.ip_switch.setRange(1, 20)
+        self.ip_switch.setValue(2)
+        self.ip_switch.setToolTip(
+            "同一条 IP 连续被拦几次就换线。限流 → 短冷却（默认 90 秒起，指数退避，封顶 15 分钟）；\n"
+            "硬拒（Access Denied 那种）→ 长冷却，连吃 3 次这条就停用不再派活。")
+        hh = QHBoxLayout()
+        hh.addWidget(QLabel("每条 IP 最短间隔"))
+        hh.addWidget(self.ip_interval)
+        hh.addWidget(QLabel("连续被拦换线"))
+        hh.addWidget(self.ip_switch)
+        g.addWidget(QLabel("轮换节奏"), row, 0)
+        g.addLayout(hh, row, 1)
+        row += 1
         self.lite = QCheckBox("省流量：图片/CSS/字体/视频不加载，第三方统计脚本按域名拦掉")
         self.lite.setChecked(True)
         self.lite.setToolTip(
@@ -348,6 +385,9 @@ class Main(QMainWindow):
                 "proxy_pass": self.proxy_pass.text(),
                 "rotate_ip": self.rotate_ip.isChecked(),
                 "lite": self.lite.isChecked(),
+                "ip_list": self.ip_list.toPlainText(),
+                "ip_interval": self.ip_interval.value(),
+                "ip_switch_after": self.ip_switch.value(),
             }), encoding="utf-8")
         except OSError:
             pass
@@ -367,6 +407,9 @@ class Main(QMainWindow):
         self.proxy_pass.setText(str(c.get("proxy_pass", "")))
         self.rotate_ip.setChecked(bool(c.get("rotate_ip", True)))
         self.lite.setChecked(bool(c.get("lite", True)))
+        self.ip_list.setPlainText(str(c.get("ip_list", "")))
+        self.ip_interval.setValue(int(c.get("ip_interval", 8)))
+        self.ip_switch.setValue(int(c.get("ip_switch_after", 2)))
         set_override(self.browser_edit.text())
 
     # ---------- browser ----------
@@ -461,10 +504,18 @@ class Main(QMainWindow):
         proxy_pass = self.proxy_pass.text()
         rotate_ip = self.rotate_ip.isChecked()
         lite = self.lite.isChecked()
+        ip_list = self.ip_list.toPlainText().strip()
+        ip_interval = int(self.ip_interval.value())
+        ip_switch_after = int(self.ip_switch.value())
         self.save_config()
+        if ip_list:
+            n = len([x for x in ip_list.splitlines() if x.strip() and not x.strip().startswith("#")])
+            exit_desc = f"IP 池轮换 {n} 条（最短间隔{ip_interval}s，连拒{ip_switch_after}次换线）"
+        else:
+            exit_desc = "走代理" if proxy else "本机直连"
         self.log(f"启动：并发 {conc} 页，每页等 {wait:.0f}s，待处理 {len(slugs)} 个地区，"
                  f"{'自动发现' if disc else '不发现'}，{'剔女' if female else '男女都留'}，"
-                 f"{'走代理' if proxy else '本机直连'}，"
+                 f"{exit_desc}，"
                  f"{'被拦换出口IP' if rotate_ip and proxy else '出口IP固定'}，"
                  f"{'不拉图片样式' if lite else '图片样式照拉'}")
 
@@ -476,7 +527,9 @@ class Main(QMainWindow):
                 eng.run_batch(slugs, concurrency=conc, progress_cb=cb, stop=self.stop_flag,
                               wait=wait, pace=pace, discover=disc, drop_female=female,
                               proxy=proxy, proxy_pass=proxy_pass,
-                              rotate_ip=rotate_ip, lite=lite)
+                              rotate_ip=rotate_ip, lite=lite,
+                              ip_list=ip_list, ip_interval=ip_interval,
+                              ip_switch_after=ip_switch_after)
                 self.bridge.log.emit("全部完成" if not self.stop_flag.is_set() else "已停止")
             except Exception as e:
                 self.bridge.log.emit(f"运行出错: {e}")

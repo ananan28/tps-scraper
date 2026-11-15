@@ -16,6 +16,10 @@ import requests
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
+# sid 轮换和 2Captcha 接口路由只留一份实现：跟 engine_core 共用
+from engine_core import (cap_api, current_sid, rand_sid, rotate_sid_now, set_sid,
+                         set_sid_window, _cap_err)
+
 # 打包(frozen)时：Windows 数据放 EXE 同级目录；macOS 放 ~/Library/Application Support（.app 包内不宜写库）；源码运行放脚本目录
 if getattr(sys, "frozen", False):
     if sys.platform == "darwin":
@@ -189,9 +193,10 @@ class LocalProxy:
     所以把认证挪到本地中继；同一浏览器实例的所有连接共用同一个 session（同一个出口 IP）。
     """
 
-    def __init__(self, upstream_host, upstream_port, username, password):
+    def __init__(self, upstream_host, upstream_port, username, password, no_auth=False):
         credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
         self._auth = f"Basic {credentials}".encode()
+        self.no_auth = bool(no_auth) or not (username or password)
         self._upstream = (upstream_host, int(upstream_port))
         self._stopped = False
         self.auth_failed = False
@@ -269,8 +274,10 @@ class LocalProxy:
 
             upstream = socket.create_connection(self._upstream, timeout=30)
             upstream.settimeout(45)
-            request = (self._drop_proxy_headers(head)
-                       + b"\r\nProxy-Authorization: " + self._auth + b"\r\n\r\n")
+            request = self._drop_proxy_headers(head)
+            if not self.no_auth:
+                request += b"\r\nProxy-Authorization: " + self._auth
+            request += b"\r\n\r\n"
             upstream.sendall(request)
 
             response, leftover = self._read_head(upstream)
@@ -318,28 +325,105 @@ class LocalProxy:
         to_client.join()
 
 
-def start_relay(proxy_template, proxy_pass, session):
-    """支持两种代理写法：
+def parse_proxy_lines(text, default_pass=""):
+    """把「代理模板」这一栏拆成一条条出口：一行一条（分号隔开也算），几种写法可以混着粘。
+
+    IP:端口:账号:密码        静态 IP 的给法，例 64.205.177.79:3227:bKdZ7:fwCfS
+    http://账号:密码@IP:端口  完整链接
+    IP:端口                  免认证（IP 白名单型）
+    账号串 + 单独「密码」栏    LinkUp 那种老写法，账号里带 {session} 就能自己换 IP
+
+    密码里带冒号也算：按前三个冒号切，剩下全归密码。
+    """
+    out = []
+    for raw in str(text or "").replace(";", "\n").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "@" in line:
+            p = urllib.parse.urlsplit(line if "://" in line else "http://" + line)
+            host, port = p.hostname or "", p.port or 80
+            user = urllib.parse.unquote(p.username or "")
+            pw = urllib.parse.unquote(p.password or "") or str(default_pass or "")
+        else:
+            seg = line.split(":", 3)
+            if len(seg) == 4 and seg[1].isdigit():
+                host, port, user, pw = seg[0], int(seg[1]), seg[2], seg[3]
+            elif len(seg) == 2 and seg[1].isdigit():
+                host, port, user, pw = seg[0], int(seg[1]), "", str(default_pass or "")
+            elif len(seg) == 1:
+                base = urllib.parse.urlsplit(PROXY_SERVER)
+                host, port, user, pw = base.hostname, base.port or 80, seg[0], str(default_pass or "")
+            else:
+                continue
+        if host:
+            out.append({"host": host, "port": int(port or 80), "user": user, "pass": pw})
+    return out
+
+
+class ProxyPool:
+    """多条出口轮着来：每次要换 IP 就取下一条，几个并发线程自动错开。只有一条时等于不轮换。"""
+
+    def __init__(self, entries):
+        self.entries = list(entries)
+        self._i = 0
+        self._lock = threading.Lock()
+
+    def __len__(self):
+        return len(self.entries)
+
+    def next(self, worker_id=0):
+        with self._lock:
+            k = self._i
+            self._i += 1
+        return self.entries[(k + worker_id) % len(self.entries)]
+
+
+_POOL_CACHE = {}
+_POOL_CACHE_LOCK = threading.Lock()
+
+
+def build_proxy_pool(text, default_pass=""):
+    """按填写内容缓存出口列表，界面每轮传同一个字符串下来就能连续轮着往下走。"""
+    key = f"{text}\x00{default_pass}"
+    with _POOL_CACHE_LOCK:
+        pool = _POOL_CACHE.get(key)
+        if pool is None or not pool.entries:
+            pool = ProxyPool(parse_proxy_lines(text, default_pass))
+            _POOL_CACHE[key] = pool
+        return pool
+
+
+def _proxy_of(proxy_template, proxy_pass, session, entry=None, sid=""):
+    """取这一条出口的最终账号：{session} 换成长随机串（LinkUp 用），
+    {sid} 换成 6-8 位字母数字（ro24proxy / 1024proxy 用，同一个 sid 至少 3 分钟才换得出新 IP）。"""
+    if entry is None:
+        entries = parse_proxy_lines(proxy_template, proxy_pass)
+        if not entries:
+            raise RuntimeError("未填写代理")
+        entry = entries[0]
+    host, port = entry["host"], int(entry["port"] or 80)
+    user = (str(entry["user"] or "")
+            .replace("{session}", str(session))
+            .replace("{sid}", sid or current_sid()))
+    pw = str(entry["pass"] or "")
+    if not host:
+        raise RuntimeError(f"代理格式错误：{entry}（需要 IP:端口:账号:密码 或 user:pass@host:port）")
+    if bool(user) != bool(pw):
+        raise RuntimeError(f"代理账号/密码不完整：{host}:{port}")
+    return host, port, user, pw
+
+
+def start_relay(proxy_template, proxy_pass, session, entry=None, sid=""):
+    """起本地中继。支持两种填法：
     1) 完整链接  http://user:pass@host:port
     2) 模板+密码 anan1_xx-ssid-{session}-country-us + 单独密码
+    代理模板用分号隔开多条 = 多条出口轮换；用户名里带 {sid} = 按 3 分钟窗口换出口 IP。
     """
     value = str(proxy_template or "").strip()
     if not value:
         raise RuntimeError("未填写代理")
-    if "@" in value:
-        if "://" not in value:
-            value = "http://" + value
-        parsed = urllib.parse.urlsplit(value)
-        host, port = parsed.hostname, parsed.port or 80
-        user = urllib.parse.unquote(parsed.username or "")
-        password = urllib.parse.unquote(parsed.password or "") or str(proxy_pass or "")
-    else:
-        base = urllib.parse.urlsplit(PROXY_SERVER)
-        host, port = base.hostname, base.port or 80
-        user, password = value, str(proxy_pass or "")
-    if not host or not user or not password:
-        raise RuntimeError(f"代理格式错误：{proxy_template}（需要 user:pass@host:port）")
-    user = user.replace("{session}", session)
+    host, port, user, password = _proxy_of(value, proxy_pass, session, entry, sid)
     return LocalProxy(host, port, user, password)
 
 
@@ -361,6 +445,13 @@ def is_blocked_title(title):
     return any(marker in low for marker in BLOCK_TITLE_MARKERS)
 
 
+# Cloudflare 托管挑战：页面里没有可提交的 sitekey，打码商一律拒单 → 不打码，原地等自过。
+# 只有这些标题算「还在出题」，等得到算赢；11-15 实测 Firefox 自过 90~165 秒。
+CF_CHALLENGE_MARKERS = ("just a moment", "attention required", "are you a robot",
+                        "verifying you are human", "checking your browser", "ddos-guard")
+CF_SELF_PASS_S = 180
+
+
 def page_status(page):
     """返回 (是否干净结果页, 标题)。
     clean=True 才代表拿到真正的 TPS 页面；否则是 Cloudflare/验证码/被拦页。
@@ -374,19 +465,15 @@ def page_status(page):
     return True, title
 
 
-def build_upstream_proxy(proxy_template, proxy_pass, session):
-    """构造与浏览器同一 session 的上游代理串（给 CapSolver 解验证码用）。"""
+def build_upstream_proxy(proxy_template, proxy_pass, session, entry=None, sid=""):
+    """构造与浏览器同一出口 IP、同一 sid 的上游代理串（给 2Captcha 解验证码用）。"""
     value = str(proxy_template or "").strip()
-    if "@" in value:
-        if "://" not in value:
-            value = "http://" + value
-        p = urllib.parse.urlsplit(value)
-        user = urllib.parse.unquote(p.username or "").replace("{session}", session)
-        pw = urllib.parse.unquote(p.password or "") or str(proxy_pass or "")
-        return f"http://{user}:{pw}@{p.hostname}:{p.port or 80}"
-    base = urllib.parse.urlsplit(PROXY_SERVER)
-    user = value.replace("{session}", session)
-    return f"http://{user}:{proxy_pass}@{base.hostname}:{base.port or 80}"
+    if not value:
+        return ""
+    host, port, user, pw = _proxy_of(value, proxy_pass, session, entry, sid)
+    if not user and not pw:
+        return f"http://{host}:{port}"
+    return f"http://{user}:{pw}@{host}:{port}"
 
 
 def twocaptcha_turnstile_proxied(page_url, upstream_proxy, api_key, action=None):
@@ -406,24 +493,24 @@ def twocaptcha_turnstile_proxied(page_url, upstream_proxy, api_key, action=None)
     }
     if action:
         params["data-s"] = str(action)
-    try:
-        result = requests.post(f"{TWOCAPTCHA_API_URL}/in.php", data=params, timeout=30).json()
-    except Exception:
+    result = cap_api("in.php", {"data": params}, upstream_proxy)
+    if result is None:
         return None
     if result.get("status") != 1:
-        return None
+        return _cap_err(f"下单被拒：{result.get('error') or str(result)[:70]}")
     task_id = result["request"]
     for _ in range(40):
         time.sleep(2)
-        try:
-            result = requests.get(f"{TWOCAPTCHA_API_URL}/res.php",
-                                  params={"key": api_key, "action": "get", "id": task_id, "json": "1"},
-                                  timeout=30).json()
-        except Exception:
+        result = cap_api("res.php", {"params": {"key": api_key, "action": "get",
+                                                "id": task_id, "json": "1"}}, upstream_proxy)
+        if result is None:
             return None
         if result.get("status") == 1:
             return result["request"]
-    return None
+        msg = str(result.get("request") or result.get("error") or "")
+        if msg.startswith("ERROR_"):
+            return _cap_err(f"解题报错：{msg}")
+    return _cap_err("解题超时（80 秒没返回 token）")
 
 
 CHALLENGE_INFO_JS = r"""
@@ -460,43 +547,10 @@ async (token) => {
 """
 
 
-def twocaptcha_cloudflare_proxied(page_url, upstream_proxy, api_key, html, user_agent):
-    """2Captcha Cloudflare 挑战页求解（Turnstile 方式），返回 {"token": ...}。"""
-    parts = urllib.parse.urlsplit(upstream_proxy)
-    proxy_str = f"{parts.username or ''}:{parts.password or ''}@{parts.hostname or ''}:{parts.port or 80}"
-    params = {
-        "key": api_key,
-        "method": "turnstile",
-        "sitekey": "0x4AAAAAAAAkg0s3VIW10P9P",
-        "pageurl": page_url,
-        "proxy": proxy_str,
-        "proxytype": "http",
-        "json": "1",
-    }
-    try:
-        r = requests.post(f"{TWOCAPTCHA_API_URL}/in.php", data=params, timeout=30).json()
-    except Exception:
-        return None
-    if r.get("status") != 1:
-        return None
-    task_id = r["request"]
-    for _ in range(60):
-        time.sleep(2)
-        try:
-            rr = requests.get(f"{TWOCAPTCHA_API_URL}/res.php",
-                              params={"key": api_key, "action": "get", "id": task_id, "json": "1"},
-                              timeout=30).json()
-        except Exception:
-            return None
-        if rr.get("status") == 1:
-            return {"token": rr["request"]}
-    return None
-
-
 def try_solve_challenge(page, upstream_proxy, api_key, origin_url=None, log=None):
     """解 TPS 的两种拦截：
     1) TPS InternalCaptcha（有 #captchaForm）：带代理解 Turnstile(action) → captchaToken fetch 提交 → 跳转
-    2) Cloudflare 挑战页（Just a moment/Captcha，无 #captchaForm）：AntiCloudflareTask 拿 cf_clearance 注入再刷
+    2) Cloudflare 挑战页（Just a moment/Captcha，无 #captchaForm）：不打码，原地等自过
     成功返回 True（页面已是正常结果页）。
     """
     def _log(m):
@@ -554,45 +608,25 @@ def try_solve_challenge(page, upstream_proxy, api_key, origin_url=None, log=None
         clean, _ = page_status(page)
         return clean
 
-    # Cloudflare 挑战页
-    _log("    疑似 Cloudflare 挑战，用 AntiCloudflareTask 取 cf_clearance...")
-    try:
-        html = page.content()
-    except Exception:
-        return False
-    sol = twocaptcha_cloudflare_proxied(page.url, upstream_proxy, api_key, html, UA)
-    if not sol:
-        _log("    Cloudflare 解失败")
-        return False
-    cf = None
-    cookies = sol.get("cookies")
-    if isinstance(cookies, dict):
-        cf = cookies.get("cf_clearance")
-    elif isinstance(cookies, list):
-        for c in cookies:
-            if isinstance(c, dict) and c.get("name") == "cf_clearance":
-                cf = c.get("value")
-                break
-    if not cf:
-        cf = sol.get("token")
-    if not cf:
-        _log(f"    未拿到 cf_clearance: {str(sol)[:120]}")
-        return False
-    _log("    拿到 cf_clearance，注入并重载...")
-    try:
-        host = urllib.parse.urlsplit(page.url).hostname or "www.truepeoplesearch.com"
-        page.context.add_cookies([{"name": "cf_clearance", "value": cf, "url": f"https://{host}/"}])
-    except Exception as exc:
-        _log(f"    cookie 注入失败: {exc}")
-        return False
-    target = origin_url or page.url
-    try:
-        goto_page(page, target, timeout=25000)
-        page.wait_for_timeout(1500)
-    except Exception:
-        return False
-    clean, _ = page_status(page)
-    return clean
+    # Cloudflare 挑战页：实测页面里没有可提交的 sitekey，打码商全部拒单，
+    # 能拿到的也只是 Turnstile token，喂不进 cf_clearance（注入假票只会反复重出题）。
+    # 这种题 Firefox 会自己过，实测 90~165 秒，所以原地等，不发解码费。
+    _log(f"    Cloudflare 挑战：不打码（解不了），等自过最多 {CF_SELF_PASS_S} 秒...")
+    deadline = time.time() + CF_SELF_PASS_S
+    while time.time() < deadline:
+        clean, title = page_status(page)
+        if clean:
+            _log("    挑战自过了，0 花费")
+            return True
+        if not any(k in (title or "").lower() for k in CF_CHALLENGE_MARKERS):
+            _log(f"    页面变成别的状态({(title or '')[:28]})，交回上层判断")
+            return False
+        try:
+            page.wait_for_timeout(3000)
+        except Exception:
+            time.sleep(2)
+    _log(f"    等了 {CF_SELF_PASS_S} 秒仍未自过，换 IP")
+    return False
 
 
 PAGE_EXTRACT_JS = """
@@ -820,12 +854,23 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
     last_title = ""
     last_error = ""
 
+    pool = build_proxy_pool(proxy_template, proxy_pass)
+    if not pool.entries:
+        raise RuntimeError(f"代理填法不认：{str(proxy_template)[:70]}"
+                           "（一行一条：IP:端口:账号:密码 或 http://账号:密码@IP:端口）")
+
     for attempt in range(max_attempts):
         session = f"session_{int(time.time() * 1000) % 1000000}_{worker_id}"
-        upstream_proxy = build_upstream_proxy(proxy_template, proxy_pass, session)
+        sid = current_sid(worker_id) if attempt == 0 else rotate_sid_now(worker_id)
+        entry = pool.next(worker_id)
+        upstream_proxy = build_upstream_proxy(proxy_template, proxy_pass, session, entry, sid)
         scrape_detail.upstream_proxy = upstream_proxy
-        relay = start_relay(proxy_template, proxy_pass, session)
-        _progress(f"[W{worker_id}] 第{attempt+1}/{max_attempts}次尝试，出口 session={session}")
+        relay = start_relay(proxy_template, proxy_pass, session, entry, sid)
+        _progress(f"[W{worker_id}] 第{attempt+1}/{max_attempts}次尝试，"
+                  f"出口 {entry['host']}:{entry['port']}"
+                  + (f"（{len(pool)} 条轮换）" if len(pool) > 1 else "")
+                  + (f" sid={sid}" if "{sid}" in str(entry["user"]) else "")
+                  + (f" session={session}" if "{session}" in str(entry["user"]) else ""))
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(

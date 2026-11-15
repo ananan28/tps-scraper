@@ -43,6 +43,19 @@ def main():
     launcher.write_text('@echo off\r\ncd /d "%~dp0"\r\nstart "" "' + NAME + '.exe"\r\n',
                         encoding="gbk", newline="")
 
+    # 无人值守：程序被断电/崩溃带走后自己再拉起来，并接着上次没跑完的地址继续
+    (DIST / "断网断电自动续跑.bat").write_text(
+        '@echo off\r\n'
+        'rem 无人值守：程序退出（断电、崩溃、断网卡死）后 30 秒再拉起来，自动接着上次没跑完的地址继续\r\n'
+        'cd /d "%~dp0"\r\n'
+        ':loop\r\n'
+        'echo [%date% %time%] 启动续跑 >> 续跑记录.txt\r\n'
+        f'start "" /wait "{NAME}.exe" --resume\r\n'
+        'echo [%date% %time%] 程序退出，30 秒后再拉起 >> 续跑记录.txt\r\n'
+        'timeout /t 30 /nobreak >nul\r\n'
+        'goto loop\r\n',
+        encoding="gbk", newline="")
+
     print("完成！交付文件夹：", DIST, flush=True)
 
 

@@ -920,86 +920,94 @@ class Main(QMainWindow):
 
         def work():
             try:
-                with eng.connect() as con:
-                    rows = con.execute(
-                        "SELECT address FROM addresses WHERE status='pending' ORDER BY id LIMIT ?",
-                        (self.START_LIMIT,)).fetchall()
-                    total_pending = con.execute(
-                        "SELECT COUNT(*) FROM addresses WHERE status='pending'").fetchone()[0]
-                addresses = [r["address"] for r in rows]
+                while self.running:      # 自动续批：一批跑完不停工，接着取下一批，直到没有未用地址
+                    with eng.connect() as con:
+                        rows = con.execute(
+                            "SELECT address FROM addresses WHERE status='pending' ORDER BY id LIMIT ?",
+                            (self.START_LIMIT,)).fetchall()
+                        total_pending = con.execute(
+                            "SELECT COUNT(*) FROM addresses WHERE status='pending'").fetchone()[0]
+                    addresses = [r["address"] for r in rows]
 
-                if not addresses:
-                    self.bridge.log.emit("没有未使用的地址（先导入，或点「重试失败」）")
-                    return
-                if total_pending > len(addresses):
-                    self.bridge.log.emit(f"未用地址共 {total_pending} 个，本轮先派 {len(addresses)} 个，"
-                                         f"跑完再点开始继续")
+                    if not addresses:
+                        self.bridge.log.emit("没有未使用的地址（先导入，或点「重试失败」）")
+                        return
+                    if total_pending > len(addresses):
+                        self.bridge.log.emit(f"未用地址共 {total_pending} 个，本轮先派 {len(addresses)} 个，"
+                                             f"跑完自动接下一批")
 
-                self.bridge.log.emit(f"开始处理 {len(addresses)} 个地址...")
+                    self.bridge.log.emit(f"开始处理 {len(addresses)} 个地址...")
 
-                def on_progress(msg):
-                    self.bridge.log.emit(msg)
+                    def on_progress(msg):
+                        self.bridge.log.emit(msg)
 
-                # 队列式调度：只保持并发数那么多在跑，完成一个补一个（支持暂停）
-                # 线程池按并发数的 2 倍预留（改大并发时不用重开），最多 128 路
-                pool_cap = min(128, max(16, concurrency * 2))
-                dropped = 0
-                with ThreadPoolExecutor(max_workers=pool_cap, thread_name_prefix="tps") as executor:
-                    futures = {}
-                    idx = 0
-                    queue = deque(addresses)
+                    # 队列式调度：只保持并发数那么多在跑，完成一个补一个（支持暂停）
+                    # 线程池按并发数的 2 倍预留（改大并发时不用重开），最多 128 路
+                    pool_cap = min(128, max(16, concurrency * 2))
+                    dropped = 0
+                    with ThreadPoolExecutor(max_workers=pool_cap, thread_name_prefix="tps") as executor:
+                        futures = {}
+                        idx = 0
+                        queue = deque(addresses)
 
-                    while queue or futures:
-                        limit = min(max(1, self._concurrency), pool_cap)
-                        while self.running and len(futures) < limit and queue:
-                            addr = queue.popleft()
-                            if not self._still_pending(addr):
-                                dropped += 1
+                        while queue or futures:
+                            limit = min(max(1, self._concurrency), pool_cap)
+                            while self.running and len(futures) < limit and queue:
+                                addr = queue.popleft()
+                                if not self._still_pending(addr):
+                                    dropped += 1
+                                    continue
+                                future = executor.submit(
+                                    eng.process_address, addr, proxy, proxy_pass, capsolver,
+                                    worker_id=idx, progress_cb=on_progress,
+                                    max_attempts=max_attempts, min_age=min_age, max_age=max_age,
+                                    max_rotations=max_rotations, max_person_tries=max_person_tries,
+                                    keep_genders=(None if len(keep_genders) == 4 else keep_genders))
+                                futures[future] = addr
+                                idx += 1
+
+                            if not futures:
+                                break
+
+                            # 阻塞等到「至少有一个跑完」，不再固定睡 0.5 秒空转
+                            done_futures, _ = wait(list(futures), timeout=0.3,
+                                                   return_when=FIRST_COMPLETED)
+                            if not done_futures:
                                 continue
-                            future = executor.submit(
-                                eng.process_address, addr, proxy, proxy_pass, capsolver,
-                                worker_id=idx, progress_cb=on_progress,
-                                max_attempts=max_attempts, min_age=min_age, max_age=max_age,
-                                max_rotations=max_rotations, max_person_tries=max_person_tries,
-                                keep_genders=(None if len(keep_genders) == 4 else keep_genders))
-                            futures[future] = addr
-                            idx += 1
 
-                        if not futures:
-                            break
-
-                        # 阻塞等到「至少有一个跑完」，不再固定睡 0.5 秒空转
-                        done_futures, _ = wait(list(futures), timeout=0.3,
-                                               return_when=FIRST_COMPLETED)
-                        if not done_futures:
-                            continue
-
-                        for future in done_futures:
-                            url = futures.pop(future)
-                            try:
-                                success, data = future.result()
-                                if success:
-                                    self.bridge.log.emit(
-                                        f"✓ {url[:34]}：网站总数{data['records']}条 → 卡片总数{data.get('cards_seen', 0)}张 → "
-                                        f"性别年龄达标 存{data['people']}人（无号码{data.get('no_phone', 0)}）总数不重复{data['phones']}电话 / "
-                                        f"跳过 年龄不符:{data.get('skipped_low', 0) + data.get('skipped_high', 0)}"
-                                        f" 性别不符:{data.get('skipped_gender', 0)} 重复:{data.get('dup_skipped', 0)}"
-                                        f" 故:{data.get('dead_skipped', 0)} 拦:{data.get('skipped_blocked', 0)}"
-                                        f" 弃:{data.get('abandoned', 0)} / "
-                                        f"{format_traffic(data.get('traffic_kb', 0))}")
-                                else:
-                                    self.bridge.log.emit(
-                                        f"✗ {url[:34]}：{data.get('error') or '失败'}（{data.get('title', '')[:60]}）")
-                            except Exception as e:
-                                self.bridge.log.emit(f"错误 {url[:34]}：{e}")
+                            for future in done_futures:
+                                url = futures.pop(future)
+                                try:
+                                    success, data = future.result()
+                                    if success:
+                                        self.bridge.log.emit(
+                                            f"✓ {url[:34]}：网站总数{data['records']}条 → 卡片总数{data.get('cards_seen', 0)}张 → "
+                                            f"性别年龄达标 存{data['people']}人（无号码{data.get('no_phone', 0)}）总数不重复{data['phones']}电话 / "
+                                            f"跳过 年龄不符:{data.get('skipped_low', 0) + data.get('skipped_high', 0)}"
+                                            f" 性别不符:{data.get('skipped_gender', 0)} 重复:{data.get('dup_skipped', 0)}"
+                                            f" 故:{data.get('dead_skipped', 0)} 拦:{data.get('skipped_blocked', 0)}"
+                                            f" 弃:{data.get('abandoned', 0)} / "
+                                            f"{format_traffic(data.get('traffic_kb', 0))}")
+                                    else:
+                                        self.bridge.log.emit(
+                                            f"✗ {url[:34]}：{data.get('error') or '失败'}（{data.get('title', '')[:60]}）")
+                                except Exception as e:
+                                    self.bridge.log.emit(f"错误 {url[:34]}：{e}")
 
                     if dropped:
                         self.bridge.log.emit(f"其中 {dropped} 个地址在排队期间已被删除/改状态，"
                                              f"没有为它们开浏览器")
                     if not self.running:
                         self.bridge.log.emit("已暂停（当前任务已完成，点击开始继续）")
-                    else:
+                        return
+
+                    # 一轮派发跑完：库里还有未用地址（超出本轮 5 万、或跑动中新导入的）→ 自动接下一轮
+                    with eng.connect() as con:
+                        n_left = con.execute(
+                            "SELECT COUNT(*) FROM addresses WHERE status='pending'").fetchone()[0]
+                    if not n_left:
                         self.bridge.log.emit("完成")
+                        return
 
             except Exception as e:
                 self.bridge.log.emit(f"启动失败: {e}")

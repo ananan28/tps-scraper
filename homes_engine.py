@@ -21,6 +21,7 @@ import nodriver as uc
 
 from engine_core import BASE, is_obvious_female, name_gender, start_relay
 from browser_path import browser_kind, describe_search, find_browser, is_bundled
+from ip_pool import IpPool
 
 DB_PATH = BASE / "homes_data.db"
 HOMES_HOST = "https://www.homes.com"
@@ -42,6 +43,9 @@ _DATA_PAGE = re.compile(r'data-page="(\d+)"')
 _SLUG_HREF = re.compile(r'href="/real-estate-agents/([a-z0-9][a-z0-9\-]{1,70})/"')
 _CANON = re.compile(r'canonical[^>]*href="https?://www\.homes\.com/real-estate-agents/([a-z0-9\-]*)"', re.I)
 _BLOCKED = ("Access Denied", "edgesuite", "Attention Required", "Pardon Our Interruption")
+# 被拦里再分一刀：这几种是「请求太频繁」，换个 IP 就能走；Access Denied 那种才是硬拒。
+# 用户判断（实测待验）：网站不拉黑，只是频繁限流。
+_RATE_MARKERS = ("rate limited", "too many requests", "pardon our interruption", "429")
 _CHALLENGE = ("Powered and protected by", "chlgeId", "privacywall",
               "Checking your browser", "cf-chl")
 
@@ -84,6 +88,14 @@ def with_session(proxy, session):
     if parsed.port:
         host = f"{host}:{parsed.port}"
     return f"{parsed.scheme or 'http'}://{urllib.parse.quote(new_user, safe='')}:{pw}@{host}"
+
+
+def proxy_url(entry):
+    """IP 池里的一条 → nodriver/中继能吃的 http:// 链接（账号密码做了 URL 转义）。"""
+    if entry["user"] and entry["pass"]:
+        return (f"http://{urllib.parse.quote(entry['user'], safe='')}:"
+                f"{urllib.parse.quote(entry['pass'], safe='')}@{entry['host']}:{entry['port']}")
+    return f"http://{entry['host']}:{entry['port']}"
 
 
 # homes.com 的州页 slug 就是州名小写；加上 DC 共 51 个入口
@@ -259,6 +271,9 @@ async def _load(tab, url, wait, tries, gate, stop, st=None):
         if blocked(html):
             gate.trip()
             if st is not None:
+                low = html.lower()
+                if any(m in low for m in _RATE_MARKERS):
+                    st["rate_seen"] = True
                 st["block_streak"] += 1
                 if st["block_streak"] >= st["rotate_after"]:
                     st["rotate"].set()
@@ -582,7 +597,7 @@ class _RoundStop:
 
 async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
                      discover, drop_female, proxy, proxy_pass, rotate_ip, lite,
-                     rotate_after=6):
+                     rotate_after=6, ip_list="", ip_interval=8.0, ip_switch_after=2):
     exe = find_browser()
     if not exe:
         raise RuntimeError("既没在本机找到 Chrome/Edge/Brave，交付文件夹里的 browser 目录"
@@ -593,17 +608,22 @@ async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
     items = queue_items(slugs)
     for item in items:
         queue.put_nowait((item[0], item[1]))
+    pool = IpPool(ip_list, min_interval=ip_interval) if ip_list.strip() else None
     st = {"browser": None, "queue": queue, "seen": known_keys(), "slugs_done": 0,
           "slugs_total": len(items), "agents": 0, "phones": 0, "nophone": 0,
           "pages": 0, "blocks": 0, "challenges": 0, "empties": 0, "new_slugs": 0,
           "queued": {s for s, _ in items},
           "inflight": set(), "cursor": {}, "gate": Gate(),
-          "rotate": asyncio.Event(), "block_streak": 0,
-          "rotate_after": rotate_after if (proxy.strip() and rotate_ip) else 1 << 30,
+          "rotate": asyncio.Event(), "block_streak": 0, "rate_seen": False, "entry": None,
+          "rotate_after": (ip_switch_after if pool is not None
+                           else rotate_after if (proxy.strip() and rotate_ip) else 1 << 30),
           "exits": 0, "dead_rounds": 0, "agents_at_round_start": 0,
           "lite_warned": False, "relay": None, "mb": 0.0}
     n_workers = max(1, int(concurrency))
-    if proxy.strip():
+    if pool is not None:
+        how = (f"IP 池轮换 {len(pool.entries)} 条（每条最短间隔 {ip_interval:.0f}s，"
+               f"连续硬拒 {ip_switch_after} 次就换线）")
+    elif proxy.strip():
         how = "被连续硬拒绝就重开浏览器换出口 IP" if rotate_ip else "出口 IP 固定不换"
     else:
         how = "本机直连，没有第二个出口 IP 可换"
@@ -617,9 +637,46 @@ async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
         rnd_no += 1
         st["rotate"].clear()
         st["block_streak"] = 0
+        st["rate_seen"] = False
         relay = None
         args = []
-        if proxy.strip():
+        entry = None
+        if pool is not None:
+            entry = pool.pick()
+            if entry is None:
+                nap = pool.wait()
+                if nap >= 1e8:
+                    progress_cb(f"⚠ IP 池 {len(pool.entries)} 条全部停用，没有可用出口，先停手")
+                    break
+                progress_cb(f"IP 池 {len(pool.entries)} 条全在冷却 → 等 {nap:.0f}s，"
+                            f"期间一个请求都不发")
+                left = nap
+                while left > 0 and not stop.is_set():
+                    await asyncio.sleep(min(15, left))
+                    left -= 15
+                if stop.is_set():
+                    break
+                entry = pool.pick()
+                if entry is None:
+                    continue
+            st["entry"] = entry
+            url = proxy_url(entry)
+            if entry["user"] and entry["pass"]:
+                try:
+                    relay = start_relay(url, "", "%06x" % random.getrandbits(24))
+                except Exception as e:
+                    progress_cb(f"!! {entry['id']} 认证起不来：{e}，先停用这条")
+                    pool.mark(entry, "hard")
+                    continue
+                args = [f"--proxy-server={relay.server}"]
+            else:
+                args = [f"--proxy-server=http://{entry['host']}:{entry['port']}"]
+            st["agents_at_round_start"] = st["agents"]
+            progress_cb(f"出口：第{rnd_no}轮换到 {entry['id']}"
+                        f"{'（带认证）' if (entry['user'] and entry['pass']) else '（免认证/白名单型）'}，"
+                        f"该条累计 请求{entry['req']} 成功{entry['ok']} "
+                        f"限流{entry['rate']} 硬拒{entry['hard']}")
+        elif proxy.strip():
             sid = "%06x" % random.getrandbits(24)
             try:
                 relay = start_relay(with_session(proxy, sid), proxy_pass, sid)
@@ -656,7 +713,7 @@ async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
                 relay.stop()
         if stop.is_set() or not st["rotate"].is_set():
             break
-        if proxy.strip() and not rotate_ip:
+        if pool is None and proxy.strip() and not rotate_ip:
             break
         if queue.empty():
             # 举了旗但没活儿了（被中断的地区都已回队列）→ 收工
@@ -668,6 +725,24 @@ async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
         else:
             st["dead_rounds"] = 0
         st["agents_at_round_start"] = st["agents"]
+        if pool is not None:
+            cur = st["entry"]
+            kind = "rate" if st["rate_seen"] else "hard"
+            cool = pool.mark(cur, kind)
+            if cur is not None:
+                why = ("限流" if kind == "rate" else
+                       f"硬拒{cur['hard_streak']}次" + ("已停用" if cur["disabled"] else ""))
+                progress_cb(f"♻ {cur['id']} {why}（{'歇 %.0fs' % cool if not cur['disabled'] else '不再派活'}）"
+                            f"｜请求{cur['req']} 成功{cur['ok']} 限流{cur['rate']} 硬拒{cur['hard']}"
+                            f"｜{pool.summary()}")
+            live = sum(1 for e in pool.entries if not e["disabled"])
+            if st["dead_rounds"] >= max(4, live * 2):
+                progress_cb(f"⚠ 已轮换 {st['exits']} 次、把 {live} 条可用 IP 扫了两轮还是 0 人，先停手。"
+                            "这不是单条 IP 的问题（多半整段被打标或网站在整体拦），"
+                            "继续换只是白请求")
+                break
+            st["exits"] += 1
+            continue
         if proxy.strip() and st["dead_rounds"] >= 8:
             progress_cb(f"⚠ 连换 {st['exits']} 个出口 IP 都一个人没抢到，先停手。"
                         "这不是单个 IP 的问题（多半是代理账号到期/被打标），"
@@ -691,14 +766,19 @@ async def _run_async(slugs, concurrency, progress_cb, stop, wait, pace,
             await asyncio.sleep(min(15, left))
             left -= 15
     mins = (time.monotonic() - started) / 60 or 1
-    if proxy.strip():
+    if pool is not None:
+        with _lock:
+            with (BASE / "homes_ip轮换.csv").open("w", encoding="utf-8-sig", newline="") as fh:
+                csv.writer(fh).writerows(pool.rows())
+        progress_cb(pool.summary() + f"｜逐条明细写 {BASE / 'homes_ip轮换.csv'}")
+    if proxy.strip() or (pool is not None and st["mb"] > 0):
         progress_cb(f"过代理流量合计 {st['mb']:.0f}MB：{st['pages']}页 → "
                     f"每页 {st['mb'] * 1000 / max(1, st['pages']):.0f}KB；"
                     f"新增 {st['agents']}人 → 每人 {st['mb'] * 1000 / max(1, st['agents']):.0f}KB"
                     f"（用时 {mins:.0f} 分钟）")
     else:
-        progress_cb(f"本机直连不计流量：{st['pages']}页 / 新增{st['agents']}人"
-                    f"（用时 {mins:.0f} 分钟）")
+        progress_cb(f"{'IP 池免认证直连不计流量' if pool is not None else '本机直连不计流量'}："
+                    f"{st['pages']}页 / 新增{st['agents']}人（用时 {mins:.0f} 分钟）")
 
 
 async def _warm_up(browser, progress_cb, stop):
@@ -730,7 +810,8 @@ async def _warm_up(browser, progress_cb, stop):
 
 def run_batch(slugs, concurrency=6, progress_cb=None, stop=None, wait=6.0, pace=0.4,
               discover=True, drop_female=True, proxy="", proxy_pass="",
-              rotate_ip=True, lite=True):
+              rotate_ip=True, lite=True, ip_list="", ip_interval=8.0,
+              ip_switch_after=2):
     """在后台线程里调用；1 个浏览器 + concurrency 个标签页。"""
     slugs = [s.strip().lower().strip("/") for s in dict.fromkeys(slugs)
              if re.match(r"^[a-z0-9][a-z0-9\-]{1,70}$", s.strip().lower().strip("/"))]
@@ -753,7 +834,9 @@ def run_batch(slugs, concurrency=6, progress_cb=None, stop=None, wait=6.0, pace=
         loop.run_until_complete(_run_async(
             slugs, int(concurrency), safe_cb, stop, float(wait), float(pace),
             bool(discover), bool(drop_female), str(proxy or ""), str(proxy_pass or ""),
-            bool(rotate_ip), bool(lite)))
+            bool(rotate_ip), bool(lite),
+            ip_list=str(ip_list or ""), ip_interval=float(ip_interval),
+            ip_switch_after=int(ip_switch_after)))
     finally:
         loop.close()
     return len(slugs)

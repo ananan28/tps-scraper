@@ -297,7 +297,7 @@ class Main(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "导出", str(BASE), "CSV (*.csv)")
         if not path:
             return
-        out, count = eng.export_csv(path)
+        out, count, _ids = eng.export_csv(path)
         self.log(f"导出 {count} 条 → {out}")
         QMessageBox.information(self, "导出", f"已导出 {count} 条")
     

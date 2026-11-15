@@ -459,6 +459,9 @@ UNSOLVABLE_MARKERS = ("rate limited", "too many requests", "access denied", "unu
 # 真正能用 2Captcha 解的 Cloudflare 挑战
 SOLVABLE_CF_MARKERS = ("just a moment", "attention required", "are you a robot",
                        "verifying you are human", "checking your browser", "ddos-guard")
+# Cloudflare 托管挑战没有可提交的 sitekey，打码商一律拒单 → 改为原地等自过。
+# 11-15 实测 Firefox 自过 90~165 秒，180 秒还不过才算这道 IP 废了。
+CF_SELF_PASS_S = 180
 
 
 def _title(page):
@@ -568,43 +571,10 @@ async (token) => {
 """
 
 
-def twocaptcha_cloudflare_proxied(page_url, upstream_proxy, api_key, html, user_agent):
-    """2Captcha Cloudflare 挑战页求解（Turnstile 方式），返回 {"token": ...}。"""
-    parts = urllib.parse.urlsplit(upstream_proxy)
-    proxy_str = f"{parts.username or ''}:{parts.password or ''}@{parts.hostname or ''}:{parts.port or 80}"
-    params = {
-        "key": api_key,
-        "method": "turnstile",
-        "sitekey": "0x4AAAAAAAAkg0s3VIW10P9P",
-        "pageurl": page_url,
-        "proxy": proxy_str,
-        "proxytype": "http",
-        "json": "1",
-    }
-    try:
-        r = requests.post(f"{TWOCAPTCHA_API_URL}/in.php", data=params, timeout=30).json()
-    except Exception:
-        return None
-    if r.get("status") != 1:
-        return None
-    task_id = r["request"]
-    for _ in range(60):
-        time.sleep(2)
-        try:
-            rr = requests.get(f"{TWOCAPTCHA_API_URL}/res.php",
-                              params={"key": api_key, "action": "get", "id": task_id, "json": "1"},
-                              timeout=30).json()
-        except Exception:
-            return None
-        if rr.get("status") == 1:
-            return {"token": rr["request"]}
-    return None
-
-
 def try_solve_challenge(page, upstream_proxy, api_key, origin_url=None, log=None):
     """解 TPS 的两种拦截：
     1) TPS InternalCaptcha（有 #captchaForm）：带代理解 Turnstile(action) → captchaToken fetch 提交 → 跳转
-    2) Cloudflare 挑战页（Just a moment/Captcha，无 #captchaForm）：AntiCloudflareTask 拿 cf_clearance 注入再刷
+    2) Cloudflare 挑战页（Just a moment/Captcha，无 #captchaForm）：不打码，原地等自过
     成功返回 True（页面已是正常结果页）。
     """
     def _log(m):
@@ -673,45 +643,25 @@ def try_solve_challenge(page, upstream_proxy, api_key, origin_url=None, log=None
         _log(f"    无表单且非 Cloudflare 挑战({low_title[:32] or '空标题'})，不送解码")
         return False
 
-    # Cloudflare 挑战页
-    _log("    疑似 Cloudflare 挑战，用 AntiCloudflareTask 取 cf_clearance...")
-    try:
-        html = page.content()
-    except Exception:
-        return False
-    sol = twocaptcha_cloudflare_proxied(page.url, upstream_proxy, api_key, html, UA)
-    if not sol:
-        _log("    Cloudflare 解失败")
-        return False
-    cf = None
-    cookies = sol.get("cookies")
-    if isinstance(cookies, dict):
-        cf = cookies.get("cf_clearance")
-    elif isinstance(cookies, list):
-        for c in cookies:
-            if isinstance(c, dict) and c.get("name") == "cf_clearance":
-                cf = c.get("value")
-                break
-    if not cf:
-        cf = sol.get("token")
-    if not cf:
-        _log(f"    未拿到 cf_clearance: {str(sol)[:120]}")
-        return False
-    _log("    拿到 cf_clearance，注入并重载...")
-    try:
-        host = urllib.parse.urlsplit(page.url).hostname or "www.truepeoplesearch.com"
-        page.context.add_cookies([{"name": "cf_clearance", "value": cf, "url": f"https://{host}/"}])
-    except Exception as exc:
-        _log(f"    cookie 注入失败: {exc}")
-        return False
-    target = origin_url or page.url
-    try:
-        goto_page(page, target, timeout=25000)
-        page.wait_for_timeout(1500)
-    except Exception:
-        return False
-    clean, _ = page_status(page)
-    return clean
+    # Cloudflare 挑战页：实测页面里没有可提交的 sitekey，打码商全部拒单，
+    # 能拿到的也只是 Turnstile token，喂不进 cf_clearance（注入假票只会反复重出题）。
+    # 这种题 Firefox 会自己过，实测 90~165 秒，所以原地等，不发解码费。
+    _log(f"    Cloudflare 挑战：不打码（解不了），等自过最多 {CF_SELF_PASS_S} 秒...")
+    deadline = time.time() + CF_SELF_PASS_S
+    while time.time() < deadline:
+        clean, title = page_status(page)
+        if clean:
+            _log("    挑战自过了，0 花费")
+            return True
+        if not any(k in (title or "").lower() for k in SOLVABLE_CF_MARKERS):
+            _log(f"    页面变成别的状态({(title or '')[:28]})，交回上层判断")
+            return False
+        try:
+            page.wait_for_timeout(3000)
+        except Exception:
+            time.sleep(2)
+    _log(f"    等了 {CF_SELF_PASS_S} 秒仍未自过，换 IP")
+    return False
 
 
 PAGE_EXTRACT_JS = """
