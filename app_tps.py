@@ -17,9 +17,9 @@ if getattr(sys, "frozen", False):
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QGridLayout, QGroupBox,
+    QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSplitter,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter,
     QTextEdit, QVBoxLayout, QWidget, QComboBox, QMenu
 )
 
@@ -62,12 +62,34 @@ def format_traffic(kb):
     return f"{kb} KB"
 
 
+def mount(group, inner_layout):
+    """把一段内容装进「可折叠」框里，并让那个勾选框真的能折叠。
+
+    PySide6 6.12 实测：checkable 的 QGroupBox 取消勾选后子控件仍然可见、高度一点没变，
+    也就是界面里那四个「配置/地址导入/控制/统计」的勾选框点了没反应。这里把内容装进一个
+    容器 widget，勾选状态直接切容器的可见性，折叠才是真的。
+    """
+    holder = QWidget()
+    holder.setLayout(inner_layout)
+    box = QVBoxLayout(group)
+    box.setContentsMargins(2, 0, 2, 2)
+    box.addWidget(holder)
+    holder.setVisible(group.isChecked())
+    group.toggled.connect(holder.setVisible)
+    return holder
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         eng.init_db()
         self.setWindowTitle("TPS 抓取器 v3.1.0")
-        self.resize(1400, 900)
+        # 默认尺寸跟着屏幕可用区走：以前写死 1400x900，在小屏上窗口比屏幕还高，
+        # 日志和下面的按钮被顶到屏幕外，得拖半天。
+        scr = QApplication.primaryScreen()
+        avail = scr.availableGeometry() if scr else None
+        self.resize(min(1240, avail.width() if avail else 1240),
+                    min(700, (avail.height() - 20) if avail else 700))
         self.bridge = Bridge()
         self.bridge.log.connect(self.log)
         self.bridge.refresh.connect(self.refresh)
@@ -113,9 +135,15 @@ class Main(QMainWindow):
         self.core_combo.currentIndexChanged.connect(self._apply_core)
         core_row.addWidget(self.core_combo, 1)
         config_layout.addLayout(core_row)
-        self.core_note = QLabel("")
-        self.core_note.setStyleSheet("color:#666;")
-        config_layout.addWidget(self.core_note)
+        # 两个核心的区别说明不占界面：鼠标停在上面那格才显示
+        self.core_tips = {
+            "tps": "TruePeopleSearch：详情页的验证码必须解码才能拿到号码（走验证码 Key，按次花钱）。",
+            "fps": ("FastPeopleSearch：个人页电话直出，不需要解码 Key，解码费 0；遇到 Cloudflare 验证等它自己过"
+                    "（实测有的 IP 几秒、有的要 2~3 分钟），压不住就自动换出口 IP。用真实 Chrome（nodriver）跑，"
+                    "Playwright 版实测过不了。人数默认不封顶（0），翻到列表没人才停。"
+                    "注意：勾掉「显示浏览器窗口」=无头，实测无头一直卡在 security challenge，"
+                    "连换 3 个出口 IP 各等满 200 秒都是 0 张卡片（同地址有头 5.9 秒出卡），别关窗口。"),
+        }
 
         # 代理
         proxy_row = QHBoxLayout()
@@ -134,89 +162,93 @@ class Main(QMainWindow):
         capsolver_row = QHBoxLayout()
         capsolver_row.addWidget(QLabel("验证码 Key:"))
         self.capsolver_input = QLineEdit()
-        self.capsolver_input.setMinimumWidth(300)
-        self.capsolver_input.setMinimumHeight(25)
-        self.capsolver_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.capsolver_input.setPlaceholderText("2Captcha Key（留空则只换 IP 不解码）")
         self.capsolver_input.setText(eng.get_setting("capsolver", ""))
         capsolver_row.addWidget(self.capsolver_input, 1)
         config_layout.addLayout(capsolver_row)
 
-        # 并发 + 重试 + 解验证码开关
+        # 并发 + 重试 + 解验证码开关挤同一行；FPS 三项挤同一行；防睡眠 + 保存挤同一行
+        # —— 以前一行只放两三个控件，界面被拖得比屏幕还高
         concurrency_row = QHBoxLayout()
-        concurrency_row.addWidget(QLabel("并发数:"))
+        concurrency_row.addWidget(QLabel("并发:"))
         self.concurrency_input = QSpinBox()
         self.concurrency_input.setRange(1, 9999)
         self.concurrency_input.setValue(self._concurrency)
         self.concurrency_input.valueChanged.connect(self._set_concurrency)
         concurrency_row.addWidget(self.concurrency_input)
-        concurrency_row.addWidget(QLabel("重试次数:"))
+        concurrency_row.addWidget(QLabel("重试:"))
         self.retry_input = QSpinBox()
         self.retry_input.setRange(1, 20)
         self.retry_input.setValue(int(eng.get_setting("max_attempts", 12)))
         concurrency_row.addWidget(self.retry_input)
+        self.solve_captcha_check = QCheckBox("解验证码")
+        self.solve_captcha_check.setToolTip(
+            "被拦时解验证码（默认开）。\n关＝只换 IP 不解码，TPS 核心大概率拿不到号码；FPS 核心用不上这个。")
+        self.solve_captcha_check.setChecked(eng.get_setting("solve_captcha", "1") == "1")
+        concurrency_row.addWidget(self.solve_captcha_check)
         concurrency_row.addStretch()
         config_layout.addLayout(concurrency_row)
 
-        solve_row = QHBoxLayout()
-        self.solve_captcha_check = QCheckBox("被拦时解验证码（默认开；关闭=只换 IP，号码大概率拿不到）")
-        self.solve_captcha_check.setChecked(eng.get_setting("solve_captcha", "1") == "1")
-        solve_row.addWidget(self.solve_captcha_check)
-        solve_row.addStretch()
-        config_layout.addLayout(solve_row)
-
         # FPS 抓取范围（只影响 FPS 核心）
         fps_row = QHBoxLayout()
-        fps_row.addWidget(QLabel("FPS 每地址人数:"))
+        fps_row.addWidget(QLabel("人数:"))
         self.fps_persons_input = QSpinBox()
         self.fps_persons_input.setRange(0, 500)
         self.fps_persons_input.setValue(int(eng.get_setting("fps_max_persons", "0")))
         self.fps_persons_input.setToolTip("0 = 不封顶，翻页翻到没人为止（抓全面）")
         fps_row.addWidget(self.fps_persons_input)
-        fps_row.addWidget(QLabel("FPS 翻页数:"))
+        fps_row.addWidget(QLabel("页数:"))
         self.fps_pages_input = QSpinBox()
         self.fps_pages_input.setRange(1, 20)
         self.fps_pages_input.setValue(int(eng.get_setting("fps_max_pages", "10")))
         fps_row.addWidget(self.fps_pages_input)
-        self.fps_window_check = QCheckBox("FPS 显示浏览器窗口")
+        self.fps_window_check = QCheckBox("显示窗口")
+        self.fps_window_check.setToolTip(
+            "勾上＝FPS 用真实 Chrome 有头跑（实测有头 5.9 秒出卡片）。\n"
+            "不勾＝无头，实测无头一直卡在 security challenge，连换 3 个出口 IP 各等满 200 秒都是 0 张卡片，别关。")
         self.fps_window_check.setChecked(eng.get_setting("fps_headless", "0") != "1")
         fps_row.addWidget(self.fps_window_check)
+        self.fps_hide_check = QCheckBox("挪出屏幕")
+        self.fps_hide_check.setToolTip(
+            "窗口照开、只是挪到屏幕外面看不见 —— 不是无头，挑战照样自己过。\n"
+            "一个车道一个 Chrome 窗口，实测每个吃 1.2~1.7GB 内存；并发开多了屏幕被占满、机器发飘，"
+            "就勾这个。并发数自己往下调才是真解决。")
+        self.fps_hide_check.setChecked(eng.get_setting("fps_hide_window", "0") == "1")
+        fps_row.addWidget(self.fps_hide_check)
         fps_row.addStretch()
         config_layout.addLayout(fps_row)
-        self.fps_inputs = (self.fps_persons_input, self.fps_pages_input, self.fps_window_check)
+        self.fps_inputs = (self.fps_persons_input, self.fps_pages_input,
+                           self.fps_window_check, self.fps_hide_check)
 
-        # 防睡眠定时器
+        # 防睡眠 + 保存
         sleep_row = QHBoxLayout()
         sleep_row.addWidget(QLabel("防睡眠:"))
         self.prevent_sleep_check = QCheckBox("保持唤醒")
         self.prevent_sleep_check.setChecked(eng.get_setting("prevent_sleep", "0") == "1")
         self.prevent_sleep_check.stateChanged.connect(self.toggle_sleep_prevention)
         sleep_row.addWidget(self.prevent_sleep_check)
-        sleep_row.addWidget(QLabel("定时(小时):"))
         self.sleep_timer_input = QSpinBox()
         self.sleep_timer_input.setRange(0, 168)
         self.sleep_timer_input.setValue(int(eng.get_setting("sleep_timer_hours", "0")))
         self.sleep_timer_input.valueChanged.connect(self.save_config)
+        self.sleep_timer_input.setToolTip("定时（小时）：0 = 不定时，一直唤醒到手动关")
         sleep_row.addWidget(self.sleep_timer_input)
-        sleep_row.addStretch()
-        config_layout.addLayout(sleep_row)
-
-        # 保存按钮
         save_btn = QPushButton("保存配置")
         save_btn.clicked.connect(self.save_config)
-        config_layout.addWidget(save_btn)
+        sleep_row.addWidget(save_btn)
+        config_layout.addLayout(sleep_row)
 
-        config.setLayout(config_layout)
+        mount(config, config_layout)
         left_layout.addWidget(config)
 
-        # 地址导入（可折叠）
+        # 地址导入（默认收起：只在导那一次才用，展开着白占 200 多 px）
         import_group = QGroupBox("地址导入")
         import_group.setCheckable(True)
-        import_group.setChecked(True)
+        import_group.setChecked(False)
         import_layout = QVBoxLayout()
         self.address_input = QPlainTextEdit()
         self.address_input.setPlaceholderText("每行一个地址 URL 或原始地址...")
-        self.address_input.setMaximumHeight(150)
+        self.address_input.setMaximumHeight(90)
         import_layout.addWidget(self.address_input)
 
         import_btn_row = QHBoxLayout()
@@ -229,32 +261,34 @@ class Main(QMainWindow):
         import_btn_row.addWidget(file_btn)
         import_btn_row.addStretch()
         import_layout.addLayout(import_btn_row)
-        import_group.setLayout(import_layout)
+        mount(import_group, import_layout)
         left_layout.addWidget(import_group)
 
-        # 控制区（可折叠）
+        # 控制区（可折叠）—— 8 个按钮分两行，一行摆 8 个会把左栏顶到 760px 以上
         control = QGroupBox("控制")
         control.setCheckable(True)
         control.setChecked(True)
-        control_layout = QHBoxLayout()
+        control_layout = QVBoxLayout()
+        run_row = QHBoxLayout()
+        data_row = QHBoxLayout()
 
         self.start_btn = QPushButton("▶ 开始")
         self.start_btn.clicked.connect(self.start)
-        control_layout.addWidget(self.start_btn)
+        run_row.addWidget(self.start_btn)
 
         self.pause_btn = QPushButton("⏸ 暂停")
         self.pause_btn.clicked.connect(self.pause)
         self.pause_btn.setEnabled(False)
-        control_layout.addWidget(self.pause_btn)
+        run_row.addWidget(self.pause_btn)
 
         self.stop_btn = QPushButton("⏹ 停止")
         self.stop_btn.clicked.connect(self.stop)
         self.stop_btn.setEnabled(False)
-        control_layout.addWidget(self.stop_btn)
+        run_row.addWidget(self.stop_btn)
 
         export_btn = QPushButton("导出 CSV")
         export_btn.clicked.connect(self.export)
-        control_layout.addWidget(export_btn)
+        run_row.addWidget(export_btn)
 
         self.addr_btn = QPushButton("导出地址 ▾")
         menu = QMenu(self.addr_btn)
@@ -264,30 +298,34 @@ class Main(QMainWindow):
             act = menu.addAction(label)
             act.triggered.connect(lambda _=False, s=statuses, t=label: self.export_addrs(s, t))
         self.addr_btn.setMenu(menu)
-        control_layout.addWidget(self.addr_btn)
+        data_row.addWidget(self.addr_btn)
 
         clear_btn = QPushButton("清除已导出数据")
         clear_btn.clicked.connect(self.clear_data)
-        control_layout.addWidget(clear_btn)
+        data_row.addWidget(clear_btn)
 
         retry_btn = QPushButton("重试失败")
         retry_btn.clicked.connect(self.retry_failed)
-        control_layout.addWidget(retry_btn)
+        data_row.addWidget(retry_btn)
 
         del_btn = QPushButton("删除成功")
         del_btn.clicked.connect(self.delete_done)
-        control_layout.addWidget(del_btn)
+        data_row.addWidget(del_btn)
 
-        control_layout.addStretch()
-        control.setLayout(control_layout)
+        data_row.addStretch()
+        control_layout.addLayout(run_row)
+        control_layout.addLayout(data_row)
+        mount(control, control_layout)
         left_layout.addWidget(control)
 
-        # 统计（可折叠）
+        # 统计（可折叠）—— 一行 3 组：摆 4 组会把左栏顶到 700px 以上，宽度比高度更金贵
         stats_group = QGroupBox("统计")
         stats_group.setCheckable(True)
         stats_group.setChecked(True)
         stats_layout = QGridLayout()
+        stats_layout.setHorizontalSpacing(6)
         self.stats_labels = {}
+        bold = "font-weight:bold;"
         for i, (key, label) in enumerate([
             ("pending", "待处理"),
             ("running", "运行中"),
@@ -297,30 +335,34 @@ class Main(QMainWindow):
             ("deliver", "导出条数"),
             ("phones", "全部号码"),
             ("traffic_kb", "流量"),
+            ("runtime", "运行时长"),
+            ("hourly", "每小时"),
+            ("speed", "导出速度"),
         ]):
-            stats_layout.addWidget(QLabel(f"{label}:"), i // 3, (i % 3) * 2)
+            r, c = divmod(i, 3)
+            stats_layout.addWidget(QLabel(f"{label}:"), r, c * 2)
             lbl = QLabel("0")
-            lbl.setStyleSheet("font-weight:bold; font-size:14px;")
-            stats_layout.addWidget(lbl, i // 3, (i % 3) * 2 + 1)
+            lbl.setStyleSheet(bold)
+            stats_layout.addWidget(lbl, r, c * 2 + 1)
             self.stats_labels[key] = lbl
-        # 运行时长 / 每小时速度 / 电话速度
-        stats_layout.addWidget(QLabel("运行时长:"), 3, 0)
-        self.runtime_lbl = QLabel("00:00:00")
-        self.runtime_lbl.setStyleSheet("font-weight:bold; font-size:14px;")
-        stats_layout.addWidget(self.runtime_lbl, 3, 1)
-        stats_layout.addWidget(QLabel("每小时速度:"), 3, 2)
-        self.hourly_lbl = QLabel("0 地址/小时")
-        self.hourly_lbl.setStyleSheet("font-weight:bold; font-size:14px;")
-        stats_layout.addWidget(self.hourly_lbl, 3, 3)
-        stats_layout.addWidget(QLabel("导出速度:"), 4, 0)
-        self.phone_speed_lbl = QLabel("0 条/分钟")
-        self.phone_speed_lbl.setStyleSheet("font-weight:bold; font-size:14px;")
-        stats_layout.addWidget(self.phone_speed_lbl, 4, 1)
-        stats_group.setLayout(stats_layout)
+        stats_layout.setColumnStretch(6, 1)
+        mount(stats_group, stats_layout)
         left_layout.addWidget(stats_group)
 
         left_layout.addStretch()
-        splitter.addWidget(left_widget)
+
+        # 左栏定宽 + 可滚动：以前窗口一最大化，配置那几栏跟着被拉到 1900px 宽，
+        # 一行说明直接被屏幕切掉；现在左栏最宽 680，窗口再宽也是日志吃多出来的空间。
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_widget)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(430)
+        left_scroll.setMaximumWidth(680)
+        splitter.addWidget(left_scroll)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
         # ===== 右侧：日志 =====
         right_widget = QWidget()
@@ -382,18 +424,10 @@ class Main(QMainWindow):
         name = self.core_combo.currentData()
         eng.set_setting("core", name)
         pick_core(name)
+        self.core_combo.setToolTip(self.core_tips.get(name, ""))
         if name == "fps":
-            self.core_note.setText(
-                "FastPeopleSearch：个人页电话直出，不需要解码 Key，解码费 0；"
-                "遇到 Cloudflare 验证等它自己过（实测有的 IP 几秒、有的要 2~3 分钟），"
-                "压不住就自动换出口 IP。用真实 Chrome（nodriver）跑，Playwright 版实测过不了。"
-                "人数默认不封顶（0），翻到列表没人才停。"
-                "注意：勾掉「显示浏览器窗口」=无头，实测无头一直卡在 security challenge，"
-                "连换 3 个出口 IP 各等满 200 秒都是 0 张卡片（同地址有头 5.9 秒出卡），别关窗口。")
             self.solve_captcha_check.setEnabled(False)
         else:
-            self.core_note.setText(
-                "TruePeopleSearch：详情页的验证码必须解码才能拿到号码（走验证码 Key，按次花钱）。")
             self.solve_captcha_check.setEnabled(True)
         for wid in getattr(self, "fps_inputs", ()):
             wid.setEnabled(name == "fps")
@@ -410,6 +444,7 @@ class Main(QMainWindow):
         eng.set_setting("fps_max_persons", self.fps_persons_input.value())
         eng.set_setting("fps_max_pages", self.fps_pages_input.value())
         eng.set_setting("fps_headless", "0" if self.fps_window_check.isChecked() else "1")
+        eng.set_setting("fps_hide_window", "1" if self.fps_hide_check.isChecked() else "0")
         eng.set_setting("prevent_sleep", "1" if self.prevent_sleep_check.isChecked() else "0")
         eng.set_setting("sleep_timer_hours", self.sleep_timer_input.value())
         self.log("配置已保存")
@@ -490,6 +525,11 @@ class Main(QMainWindow):
         eng.set_setting("solve_captcha", "1" if solve_captcha else "0")
         max_attempts = self.retry_input.value()
         eng.set_setting("max_attempts", max_attempts)
+        # FPS 那几格引擎是直接从库里读的，不点「保存配置」也得按面板走
+        eng.set_setting("fps_max_persons", self.fps_persons_input.value())
+        eng.set_setting("fps_max_pages", self.fps_pages_input.value())
+        eng.set_setting("fps_headless", "0" if self.fps_window_check.isChecked() else "1")
+        eng.set_setting("fps_hide_window", "1" if self.fps_hide_check.isChecked() else "0")
 
         self.running = True
         self.start_time = time.time()
@@ -635,28 +675,27 @@ class Main(QMainWindow):
     def refresh(self):
         s = eng.stats()
         for key, lbl in self.stats_labels.items():
+            if key in ("runtime", "hourly", "speed"):
+                continue
             val = s.get(key, 0)
-            if key == "traffic_kb":
-                lbl.setText(format_traffic(val))
-            else:
-                lbl.setText(str(val))
-        # 运行时长 / 每小时速度 / 电话速度
+            lbl.setText(format_traffic(val) if key == "traffic_kb" else str(val))
+        # 运行时长 / 每小时速度 / 导出速度
         if self.start_time:
             elapsed = time.time() - self.start_time
             h = int(elapsed // 3600)
             m = int((elapsed % 3600) // 60)
             sec = int(elapsed % 60)
-            self.runtime_lbl.setText(f"{h:02d}:{m:02d}:{sec:02d}")
-            done = s.get("done", 0)
-            deliver = s.get("deliver", 0)
+            self.stats_labels["runtime"].setText(f"{h:02d}:{m:02d}:{sec:02d}")
             hours = elapsed / 3600
             minutes = elapsed / 60
-            self.hourly_lbl.setText(f"{done / hours:.0f} 地址/小时" if hours > 0 else "0 地址/小时")
-            self.phone_speed_lbl.setText(f"{deliver / minutes:.1f} 条/分钟" if minutes > 0 else "0 条/分钟")
+            self.stats_labels["hourly"].setText(
+                f"{s.get('done', 0) / hours:.0f} 地址/时" if hours > 0 else "0 地址/时")
+            self.stats_labels["speed"].setText(
+                f"{s.get('deliver', 0) / minutes:.1f} 条/分" if minutes > 0 else "0 条/分")
         elif not self.running:
-            self.runtime_lbl.setText("00:00:00")
-            self.hourly_lbl.setText("0 地址/小时")
-            self.phone_speed_lbl.setText("0 条/分钟")
+            self.stats_labels["runtime"].setText("00:00:00")
+            self.stats_labels["hourly"].setText("0 地址/时")
+            self.stats_labels["speed"].setText("0 条/分")
 
 
 def _selftest():

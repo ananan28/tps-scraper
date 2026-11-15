@@ -71,8 +71,14 @@ BROWSER_ARGS = ["--no-first-run", "--no-default-browser-check",
                 "--disable-default-apps", "--disable-extensions", "--disable-sync",
                 "--disable-domain-reliability", "--disable-client-side-phishing-detection",
                 "--disable-features=OptimizationHints,MediaRouter,Translate,"
-                "InterestFeedContentSuggestions,PrivacySandboxSettings4",
+                "InterestFeedContentSuggestions,PrivacySandboxSettings4,"
+                "CalculateNativeWinOcclusion",
                 "--window-size=1024,768", "--mute-audio"]
+
+# 「隐藏窗口」= 把窗口挪到屏幕外面，不是无头。
+# 无头实测过不了这个站的挑战（连换 3 个出口 IP 各等满 200 秒 0 张卡片），
+# 挪出屏幕窗口状态仍是 normal，渲染不被降频；配合上面两条 backgrounding 参数才成立。
+OFFSCREEN_ARGS = ["--window-position=-32000,-32000"]
 
 
 class FpsBlocked(RuntimeError):
@@ -347,10 +353,12 @@ def _chrome_candidates():
     return [x for x in out if not x or Path(x).exists()] or [""]
 
 
-async def _open_browser(relay, headless, log):
+async def _open_browser(relay, headless, log, hide=False):
     """一个尝试 = 一个出口 IP = 一个浏览器：换 IP 靠重开，不用同一个浏览器里换 session。"""
     import nodriver as uc
     args = [f"--proxy-server={relay.server}"] + BROWSER_ARGS
+    if hide and not headless:
+        args += OFFSCREEN_ARGS
     browser = None
     why = ""
     for path in _chrome_candidates():
@@ -359,7 +367,8 @@ async def _open_browser(relay, headless, log):
             kwargs["browser_executable_path"] = path
         try:
             browser = await uc.start(**kwargs)
-            log(f"浏览器：{path or 'nodriver 自动找的系统 Chrome'}")
+            mode = "无头" if headless else ("窗口挪到屏幕外（看不见）" if hide else "窗口可见")
+            log(f"浏览器：{path or 'nodriver 自动找的系统 Chrome'}｜{mode}")
             if "ms-playwright" in str(path):
                 log("[!] 这台电脑没装 Google Chrome，只能用包内 Chromium 兜底 —— "
                     "实测 FPS 这个站过不了挑战（等满 180 秒 0 张卡片），装一下 Chrome 再跑")
@@ -391,7 +400,7 @@ async def _run_attempt(address, url, relay, opt):
     kind = "done"
     err = ""
     try:
-        browser, tab = await _open_browser(relay, headless, _log)
+        browser, tab = await _open_browser(relay, headless, _log, opt.get("hide", False))
 
         # ===== 列表页（含翻页）=====
         listing_url = url
@@ -558,6 +567,7 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
            "challenge_wait": int(get_setting("challenge_wait", 200)),
            "rotations": int(get_setting("fps_rotations", 2)),
            "headless": get_setting("fps_headless", "0") == "1",
+           "hide": get_setting("fps_hide_window", "0") == "1",
            "max_pages": max(1, int(max_pages)),
            "max_persons": max(0, int(max_persons)),
            "keep_genders": keep_genders}
