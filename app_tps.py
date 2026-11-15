@@ -20,10 +20,25 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSplitter,
-    QTextEdit, QVBoxLayout, QWidget
+    QTextEdit, QVBoxLayout, QWidget, QComboBox, QMenu
 )
 
-import engine_tps as eng
+import engine_tps182 as eng_tps      # 核心一：TruePeopleSearch（1.8.2 逐字节逻辑，被拦要解码）
+import engine_fps as eng_fps         # 核心二：FastPeopleSearch（个人页电话直出，解码费 0）
+
+eng = eng_tps                         # 面板「查询核心」决定它指向哪个引擎
+
+
+def pick_core(name):
+    """按面板选择切换查询核心：fps=FastPeopleSearch，其它=TruePeopleSearch。"""
+    global eng
+    eng = eng_fps if str(name).lower().startswith("fps") else eng_tps
+    eng.init_db()
+    return eng
+
+
+def core_name():
+    return "fps" if eng is eng_fps else "tps"
 
 BASE = Path(__file__).resolve().parent
 
@@ -88,6 +103,20 @@ class Main(QMainWindow):
         config.setChecked(True)
         config_layout = QVBoxLayout()
 
+        # 查询核心（网站）二选一
+        core_row = QHBoxLayout()
+        core_row.addWidget(QLabel("查询核心:"))
+        self.core_combo = QComboBox()
+        self.core_combo.addItem("TruePeopleSearch（1.8.2 原逻辑，被拦需解码）", "tps")
+        self.core_combo.addItem("FastPeopleSearch（个人页直出号码，解码费 0）", "fps")
+        self.core_combo.setCurrentIndex(1 if eng_tps.get_setting("core", "tps") == "fps" else 0)
+        self.core_combo.currentIndexChanged.connect(self._apply_core)
+        core_row.addWidget(self.core_combo, 1)
+        config_layout.addLayout(core_row)
+        self.core_note = QLabel("")
+        self.core_note.setStyleSheet("color:#666;")
+        config_layout.addWidget(self.core_note)
+
         # 代理
         proxy_row = QHBoxLayout()
         proxy_row.addWidget(QLabel("代理模板:"))
@@ -135,6 +164,26 @@ class Main(QMainWindow):
         solve_row.addWidget(self.solve_captcha_check)
         solve_row.addStretch()
         config_layout.addLayout(solve_row)
+
+        # FPS 抓取范围（只影响 FPS 核心）
+        fps_row = QHBoxLayout()
+        fps_row.addWidget(QLabel("FPS 每地址人数:"))
+        self.fps_persons_input = QSpinBox()
+        self.fps_persons_input.setRange(0, 500)
+        self.fps_persons_input.setValue(int(eng.get_setting("fps_max_persons", "0")))
+        self.fps_persons_input.setToolTip("0 = 不封顶，翻页翻到没人为止（抓全面）")
+        fps_row.addWidget(self.fps_persons_input)
+        fps_row.addWidget(QLabel("FPS 翻页数:"))
+        self.fps_pages_input = QSpinBox()
+        self.fps_pages_input.setRange(1, 20)
+        self.fps_pages_input.setValue(int(eng.get_setting("fps_max_pages", "10")))
+        fps_row.addWidget(self.fps_pages_input)
+        self.fps_window_check = QCheckBox("FPS 显示浏览器窗口")
+        self.fps_window_check.setChecked(eng.get_setting("fps_headless", "0") != "1")
+        fps_row.addWidget(self.fps_window_check)
+        fps_row.addStretch()
+        config_layout.addLayout(fps_row)
+        self.fps_inputs = (self.fps_persons_input, self.fps_pages_input, self.fps_window_check)
 
         # 防睡眠定时器
         sleep_row = QHBoxLayout()
@@ -207,6 +256,16 @@ class Main(QMainWindow):
         export_btn.clicked.connect(self.export)
         control_layout.addWidget(export_btn)
 
+        self.addr_btn = QPushButton("导出地址 ▾")
+        menu = QMenu(self.addr_btn)
+        for label, statuses in (("未使用（没跑过的）", ("pending", "running")),
+                                ("失败（换 IP 可救）", ("failed",)),
+                                ("已完成", ("done",))):
+            act = menu.addAction(label)
+            act.triggered.connect(lambda _=False, s=statuses, t=label: self.export_addrs(s, t))
+        self.addr_btn.setMenu(menu)
+        control_layout.addWidget(self.addr_btn)
+
         clear_btn = QPushButton("清除已导出数据")
         clear_btn.clicked.connect(self.clear_data)
         control_layout.addWidget(clear_btn)
@@ -234,8 +293,9 @@ class Main(QMainWindow):
             ("running", "运行中"),
             ("done", "已完成"),
             ("failed", "失败"),
-            ("results", "结果数"),
-            ("phones", "电话数"),
+            ("results", "人数"),
+            ("deliver", "导出条数"),
+            ("phones", "全部号码"),
             ("traffic_kb", "流量"),
         ]):
             stats_layout.addWidget(QLabel(f"{label}:"), i // 3, (i % 3) * 2)
@@ -252,8 +312,8 @@ class Main(QMainWindow):
         self.hourly_lbl = QLabel("0 地址/小时")
         self.hourly_lbl.setStyleSheet("font-weight:bold; font-size:14px;")
         stats_layout.addWidget(self.hourly_lbl, 3, 3)
-        stats_layout.addWidget(QLabel("电话速度:"), 4, 0)
-        self.phone_speed_lbl = QLabel("0 电话/分钟")
+        stats_layout.addWidget(QLabel("导出速度:"), 4, 0)
+        self.phone_speed_lbl = QLabel("0 条/分钟")
         self.phone_speed_lbl.setStyleSheet("font-weight:bold; font-size:14px;")
         stats_layout.addWidget(self.phone_speed_lbl, 4, 1)
         stats_group.setLayout(stats_layout)
@@ -285,6 +345,7 @@ class Main(QMainWindow):
 
         # 设置初始分割比例（左60% 右40%）
         splitter.setSizes([840, 560])
+        self._apply_core()
 
     def log(self, msg):
         try:
@@ -316,13 +377,39 @@ class Main(QMainWindow):
         """并发数变更（UI 线程），供后台调度线程安全读取。"""
         self._concurrency = int(value)
 
+    def _apply_core(self, *_):
+        """面板切核心：换查询网站，同时提醒各自的成本口径。"""
+        name = self.core_combo.currentData()
+        eng.set_setting("core", name)
+        pick_core(name)
+        if name == "fps":
+            self.core_note.setText(
+                "FastPeopleSearch：个人页电话直出，不需要解码 Key，解码费 0；"
+                "遇到 Cloudflare 验证等它自己过（实测有的 IP 几秒、有的要 2~3 分钟），"
+                "压不住就自动换出口 IP。用真实 Chrome（nodriver）跑，Playwright 版实测过不了。"
+                "人数默认不封顶（0），翻到列表没人才停。"
+                "注意：勾掉「显示浏览器窗口」=无头，实测无头一直卡在 security challenge，"
+                "连换 3 个出口 IP 各等满 200 秒都是 0 张卡片（同地址有头 5.9 秒出卡），别关窗口。")
+            self.solve_captcha_check.setEnabled(False)
+        else:
+            self.core_note.setText(
+                "TruePeopleSearch：详情页的验证码必须解码才能拿到号码（走验证码 Key，按次花钱）。")
+            self.solve_captcha_check.setEnabled(True)
+        for wid in getattr(self, "fps_inputs", ()):
+            wid.setEnabled(name == "fps")
+        self.refresh()
+
     def save_config(self):
+        self._apply_core()
         eng.set_setting("proxy", self.proxy_input.text().strip())
         eng.set_setting("proxy_pass", self.proxy_pass.text().strip())
         eng.set_setting("capsolver", self.capsolver_input.text().strip())
         eng.set_setting("concurrency", self.concurrency_input.value())
         eng.set_setting("max_attempts", self.retry_input.value())
         eng.set_setting("solve_captcha", "1" if self.solve_captcha_check.isChecked() else "0")
+        eng.set_setting("fps_max_persons", self.fps_persons_input.value())
+        eng.set_setting("fps_max_pages", self.fps_pages_input.value())
+        eng.set_setting("fps_headless", "0" if self.fps_window_check.isChecked() else "1")
         eng.set_setting("prevent_sleep", "1" if self.prevent_sleep_check.isChecked() else "0")
         eng.set_setting("sleep_timer_hours", self.sleep_timer_input.value())
         self.log("配置已保存")
@@ -381,6 +468,8 @@ class Main(QMainWindow):
         self.refresh()
 
     def start(self):
+        # 开跑前按面板重绑一次核心，后台线程提交的就是这个 eng
+        pick_core(self.core_combo.currentData())
         proxy = self.proxy_input.text().strip()
         proxy_pass = self.proxy_pass.text().strip()
         capsolver = self.capsolver_input.text().strip()
@@ -454,8 +543,9 @@ class Main(QMainWindow):
                                 success, data = future.result()
                                 if success:
                                     self.bridge.log.emit(
-                                        f"✓ {url[:34]}：{data['records']}条记录 / {data['people']}人 / "
-                                        f"{data['phones']}电话 / {format_traffic(data.get('traffic_kb', 0))}")
+                                        f"✓ {url[:34]}：入库{data['people']}人 / 出表{data['people']}条"
+                                        f"（每人1个常用号）/ 库内全部号{data['phones']} / "
+                                        f"{format_traffic(data.get('traffic_kb', 0))}")
                                 else:
                                     self.bridge.log.emit(
                                         f"✗ {url[:34]}：{data.get('error') or '失败'}（{data.get('title', '')[:60]}）")
@@ -534,6 +624,14 @@ class Main(QMainWindow):
         self.log(f"导出 {count} 条 → {out}")
         QMessageBox.information(self, "导出", f"已导出 {count} 条")
 
+    def export_addrs(self, statuses, label):
+        path, _ = QFileDialog.getSaveFileName(self, f"导出{label}地址", str(BASE), "Text (*.txt)")
+        if not path:
+            return
+        out, count = eng.export_addresses(statuses, path)
+        self.log(f"导出{label}地址 {count} 条 → {out}")
+        QMessageBox.information(self, "导出", f"{label} {count} 条地址")
+
     def refresh(self):
         s = eng.stats()
         for key, lbl in self.stats_labels.items():
@@ -550,15 +648,15 @@ class Main(QMainWindow):
             sec = int(elapsed % 60)
             self.runtime_lbl.setText(f"{h:02d}:{m:02d}:{sec:02d}")
             done = s.get("done", 0)
-            phones = s.get("phones", 0)
+            deliver = s.get("deliver", 0)
             hours = elapsed / 3600
             minutes = elapsed / 60
             self.hourly_lbl.setText(f"{done / hours:.0f} 地址/小时" if hours > 0 else "0 地址/小时")
-            self.phone_speed_lbl.setText(f"{phones / minutes:.1f} 电话/分钟" if minutes > 0 else "0 电话/分钟")
+            self.phone_speed_lbl.setText(f"{deliver / minutes:.1f} 条/分钟" if minutes > 0 else "0 条/分钟")
         elif not self.running:
             self.runtime_lbl.setText("00:00:00")
             self.hourly_lbl.setText("0 地址/小时")
-            self.phone_speed_lbl.setText("0 电话/分钟")
+            self.phone_speed_lbl.setText("0 条/分钟")
 
 
 def _selftest():

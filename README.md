@@ -36,22 +36,31 @@
 | `app_ui.py` | TPS 主用版界面（带可调阈值），入口就是它 |
 | `realtor_engine.py` / `app_realtor.py` | realtor.com 引擎 + 界面 |
 | `homes_engine.py` / `app_homes.py` | homes.com 引擎 + 界面 |
+| `ip_pool.py` | IP 轮换池：吃一批 IP（`ip:port` / `ip:port:user:pass` / `http://user:pass@host:port` 三种写法混着都行），轮着派活、谁被限流谁歇着、连拒 3 次停用，全冷却就等最短那条。homes 引擎用它；纯数据结构不碰网络，别的引擎也能直接复用 |
 | `browser_path.py` | 浏览器定位，三级顺序：界面手选的路径 → 本机装的 Chrome/Edge/Brave（注册表 App Paths → 各盘符 Program Files → `C:\Users\*` 所有用户配置 → PATH）→ 交付文件夹自带的 `browser\chrome-win64\chrome.exe`。nodriver 自带的探测只翻 PROGRAMFILES 环境变量，换台机器就报 "could not find chrome browser binary"，所以两个 nodriver 引擎都显式传 `browser_executable_path`。用自带那份时自动加 `--no-sandbox`（非标准安装路径下 Chromium 沙箱会报 "Sandbox cannot access executable"），本机真 Chrome 不动 |
 | `bundle_browser.py` | 打包时把本机 `ms-playwright` 里那份 Chromium 塞进交付文件夹的 `browser\`（同盘优先硬链接，不额外占空间；目标机没装任何浏览器也能跑）。源在 `C:\Users\<你>\AppData\Local\ms-playwright\chromium-*\chrome-win64`，没有就先 `python -m playwright install chromium` |
 | `build_ui.py` / `build_realtor.py` / `build_homes.py` | 各自打 Windows 免安装 EXE，产物落在 `dist_*`；后两个还会调 `bundle_browser` 带上一份 Chromium，并生成 `启动*.bat` + `浏览器自检.bat` |
 | `build_mac.py` + `打包Mac.command` + `.github/workflows/build-mac.yml` | mac 端 `.app`：Windows 交叉打不出来，靠 GitHub Actions 在 mac runner 上构建 |
 | `copy_to_usb.py` | 把 `TPS_v1.8.2_UI` 整包拷 U 盘，数据库走 SQLite backup API 做一致快照（不会拷到半截的 `-wal`） |
+| `app_tps.py` + `engine_tps182.py` + `engine_fps.py` | **当前交付的那一个界面 = 两核心版**：界面里可选 TPS(1.8.2 内核) 或 FPS(fastpeoplesearch，nodriver 真 Chrome)；两边共用同一个库 `tps_data.db`、同一套年龄/性别/去重口径、同一个 `export_csv()`。详见第九节 |
+| `proxy_relay.py` | 本地 CONNECT 代理中继 + 代理模板解析（`{session}` 粘性会话占位），TPS 引擎和两个地址抓取器共用；只用标准库，为了让 nodriver 那条线不必带 playwright |
+| `address_pool.py` | 全美地址池：按真实 ZIP 查 Zillow 房产站，只收街道地址，按房价分两档（普通 / 高净值）入库 |
+| `pw_engine.py` | PropWire 地址池共用引擎（DataDome 只认真浏览器，走本机网络 + 本机浏览器），被两个地址抓取器入口调用 |
+| `app_addr.py` | 两个地址抓取器共用的界面（抓取 / 库存导出 / 失败台账三页签），入口脚本传档位 |
+| `普通地址抓取.py` / `高净值地址抓取.py` | 两个地址抓取器的双击入口（一个估价区间、一个门槛上不封顶） |
+| `build_addr.py` | 打这两个地址抓取器的 EXE：onedir + `--windowed` + 自带 Chromium |
+| `断网断电自动续跑.bat` | 开机自动接着上次那批地址继续跑的启动脚本 |
 | `requirements.txt` | 依赖清单 |
 
 **留着但对比的旧版（别改，除非要复现行为差异）**
 
 | 文件 | 用途 |
 |---|---|
-| `engine_tps.py` / `app_tps.py` / `build.py` | TPS v3.0.0 试验版，后来回到 1.8.2 内核，现由 `engine_core.py` + `app_ui.py` 取代 |
+| `engine_tps.py` | TPS v3.0.0 试验版引擎，后来回到 1.8.2 内核，现由 `engine_core.py` 取代（`app_tps.py` / `build.py` 已经转成当前两核心交付版，见上面那张表） |
 | `app_tps_v182.py` | 更早的 1.8.2 简易界面，同样已被 `app_ui.py` 取代 |
 | `CHANGELOG_v3.0.0.md` | v3.0.0 那次改了什么，留档 |
 
-只有 `engine_core.py` / `app_ui.py` / `realtor_engine.py` / `app_realtor.py` / `homes_engine.py` / `app_homes.py` 是日常在改的；其余都在仓库历史里躺着，不用拷到别的机器。
+日常在改的：`app_tps.py` / `engine_tps182.py` / `engine_fps.py` / `engine_core.py`（两核心这条线）和 `app_ui.py` / `realtor_engine.py` / `app_realtor.py` / `homes_engine.py` / `app_homes.py` / `pw_engine.py` / `app_addr.py`；其余都在仓库历史里躺着，不用拷到别的机器。
 
 ## 三、交付出去的东西是什么
 
@@ -161,3 +170,52 @@ realtor 走本机直连、无验证码。代价是慢 —— 已经确定"慢点
 2. 每台分不同地址段/地区段，避免重复劳动
 3. 或动态领任务：做完一批领下一批
 4. 参考：19 万地址 ÷ 20 台 ≈ 每台 1 万地址
+
+## 九、两核心交付版（`新年龄修复版_两核心覆盖包`）= 现在在用的这一个
+
+一个界面 + 一个库，两个核心在界面上选：
+
+| 核心 | 目标站 | 过站方式 | 验证码 | 说明 |
+|---|---|---|---|---|
+| TPS | truepeoplesearch.com | Playwright + stealth | **要**（2Captcha，关了 0 号码） | 抽取算法与 1.8.2 逐字节一致，只带已授权的修复 |
+| FPS | fastpeoplesearch.com | nodriver + 真 Chrome（有头） | **不需要**，Cloudflare 托管挑战自己过（实测 0s / 148s / 162s 三种） | 个人页电话直出，解码费 0；无头 / Playwright 都卡在挑战页，已判死 |
+
+源码分工：`engine_tps182.py` 是两个核心共用的库层（建表、`stats()`、`export_csv()`、年龄清洗），
+`engine_fps.py` 只管 FPS 的抓页面 + 解析，界面 `app_tps.py`。FPS 直接 `export_csv = tps.export_csv`，
+所以**两个核心导出来的表格式一模一样**，改口径只改一处。
+
+### 界面上三个数分别是什么（这块口径 2026-11-15 定过，别再改回去）
+
+以前界面写「结果数 / 号码数」，他看着像虚报：一屏显示 42 人 / 219 个号，导出的表只有 37 行。
+实测对平过，219 是真的（一人最多挂 12 个号），37 是因为**导出改成一人一行、只给第一个常用号**，
+外加 5 行被年龄拦掉。现在三个标签直接对着数：
+
+- **人数** = `results` 表行数（一个活人一行）
+- **导出条数** = `deliver` = 按界面上的年龄范围**现在真能导出来的行数**，和 CSV 的行数必须一模一样
+- **全部号码** = 所有人名下号码的个数合计（一人能有十几个），只是库里的存量，**不代表导出会给出这么多行**
+
+三条硬规矩：
+1. **显示的就是他会拿到的东西**，不报好看但拿不到的数（「我的意思是显示要准确 不要报假数据」）。
+2. 导出**一人一行、只写第一个常用号**（页面上排最前那个）。其余号仍在库里，他要全导随时再改。
+3. 导出和统计共用同一个年龄判定 `engine_tps182._passes_age()`，两边数出来的必须相等 —— 用 `_age_cell()`
+   清洗：非数字留空、>120 也留空（实测 `413 岁` 是 `(413)` 电话区号被当年龄读），
+   **留空 = 不知道年龄 = 不参与拦**，不因为读错一个数把整个人丢掉。
+   「导出速度」也改成按 `deliver` 算，单位写「条/分钟」。
+
+### 覆盖安装：`覆盖升级_双击我.bat`
+
+给已经在用老版本的机器做原地升级用的（**只覆盖程序，绝不动 `tps_data.db` 和 `logs\`**）。
+三道闸，任一不过就停手并提示，一个文件都不写：
+
+1. 目标文件夹里**没有 `TPS抓取器.exe`** → 认定选错目录，停（防他把包路径当成目标）。
+2. 有 `TPS抓取器` 进程**且跑的就是目标那一份**（按 `Get-Process` 的 `.Path` 比，读不到路径按最坏情况算）→ 停，
+   只跑在别处的只提示不拦。别用 WMI `Win3_Process.ExecutablePath`，沙箱实测那条不稳。
+3. 拷完比 `TPS抓取器.exe` 的**字节数**，不等 → 停并让他重拷。
+
+bat 正文是 **GBK**、里面不加 `chcp`（这台机 ACP=936，加了 `chcp 65001` 中文提示会乱码）。
+交付包本身**不要压缩**，直接给解压好的文件夹，而且**不许混进 `.db` / `logs`**。
+
+### 抓完一个地址界面那行怎么读
+
+`✓ …：入库N人 / 出表N条（每人1个常用号）/ 库内全部号M / 流量…` —— 入库数和出表条数刻意做成同一个数，
+不一致就说明导出漏人了；`M` 只是库存号码数。

@@ -15,10 +15,14 @@ def main():
     print("[1/3] PyInstaller 打包（含 Playwright 驱动，体积大请耐心等待）...", flush=True)
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--onedir", "--windowed",
                     "--name", NAME,
+                    "--distpath", str(BASE / "dist"),
+                    "--workpath", str(BASE / "build"),
+                    "--specpath", str(BASE),
                     "--collect-all", "playwright",
                     "--collect-all", "playwright_stealth",
+                    "--collect-all", "nodriver",
                     "--collect-all", "certifi",
-                    str(BASE / "app_tps.py")], check=True)
+                    str(BASE / "app_tps.py")], check=True, cwd=str(BASE))
 
     print("[2/3] 捆绑 Chromium 浏览器...", flush=True)
     src = Path(os.environ["LOCALAPPDATA"]) / "ms-playwright"
