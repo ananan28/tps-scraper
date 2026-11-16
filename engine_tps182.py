@@ -439,6 +439,37 @@ def page_status(page):
     return True, title
 
 
+CF_CHL_OPT = "_cf_chl_opt"
+RATE_BODY_MARKERS = ("rate limit exceeded", "you have exceeded the amount of requests",
+                     "allotted time limit", "this ip has been rate limited")
+HARD_BLOCK_BODY_MARKERS = ("sorry, you have been blocked", "you've been blocked",
+                           "you are unable to access")
+
+
+class DetailHardBlocked(RuntimeError):
+    """详情页撞上限流/拉黑硬页：整条出口 IP 已经废了，
+    剩下的人绝不能一个个「跳过此人」当成做完了，必须关掉浏览器重开换 IP。"""
+
+
+def hard_page_kind(page):
+    """标题已判不干净时再分一刀：带 _cf_chl_opt 的是会自过的挑战（等/解都对）；
+    正文写「限流」或「你已经被拒」的是硬页 —— 同一条 IP 再等多久都原样返回，
+    打码也解不了，只能换出口。返回 'rate' / 'block' / ""。
+    签名来自归档原件（Temp\\sourcescan\\rate_hit*）：31 份硬页 0 份带 _cf_chl_opt，
+    11 份真挑战页 11 份都带。"""
+    try:
+        low = (page.content() or "").lower()
+    except Exception:
+        return ""
+    if CF_CHL_OPT in low:
+        return ""
+    if any(k in low for k in RATE_BODY_MARKERS):
+        return "rate"
+    if any(k in low for k in HARD_BLOCK_BODY_MARKERS):
+        return "block"
+    return ""
+
+
 def build_upstream_proxy(proxy_template, proxy_pass, session):
     """构造与浏览器同一 session 的上游代理串（给 CapSolver 解验证码用）。"""
     value = str(proxy_template or "").strip()
@@ -726,6 +757,7 @@ PRIMARY_PHONE_JS = r"""
 
 def scrape_detail(page, person, address, now):
     """打开个人页，取主号码。"""
+    scrape_detail.hard_blocked = ""
     try:
         detail_url = person["link"] if person["link"].startswith("http") else TPS_HOST + person["link"]
         if not goto_page(page, detail_url, timeout=30000):
@@ -737,14 +769,23 @@ def scrape_detail(page, person, address, now):
         if not clean:
             up = getattr(scrape_detail, "upstream_proxy", None)
             prog = getattr(scrape_detail, "progress", None)
-            low_dt = (_dt or "").lower()
-            # 被拦就解（同 1.8.2）；限流页解不了，直接判定失败
-            can_solve = (up and getattr(scrape_detail, "solve_captcha", True)
-                         and "rate limit" not in low_dt and "too many" not in low_dt)
+            hard = hard_page_kind(page)
+            # 硬页（限流/拉黑）打码解不了，白花钱还白等；会自过的挑战才值得解（同 1.8.2）
+            can_solve = (up and getattr(scrape_detail, "solve_captcha", True) and not hard)
             if can_solve and try_solve_challenge(page, up, scrape_detail.capsolver_key,
                                                  origin_url=detail_url, log=prog):
                 clean, _dt = page_status(page)
             if not clean:
+                if hard:
+                    # 整条出口 IP 已经废了，别把剩下的人一个个「跳过」当做完
+                    scrape_detail.hard_blocked = hard
+                    if prog:
+                        try:
+                            prog(f"    详情被{'限流' if hard == 'rate' else '拉黑'}"
+                                 f"（{(_dt or 'blocked')[:30]}），这条出口 IP 废了")
+                        except Exception:
+                            pass
+                    return None, 0
                 if prog:
                     try:
                         prog(f"    详情被拦({(_dt or 'blocked')[:30]})，跳过此人")
@@ -916,19 +957,21 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                     clean, title = page_status(page)
                     last_title = title
                     if not clean:
-                        low_t = (title or "").lower()
-                        # 限流页解不了，别浪费验证码，直接换 IP
-                        solvable = (solve_captcha and capsolver_key
-                                    and "rate limit" not in low_t and "too many" not in low_t)
+                        hard = hard_page_kind(page)
+                        # 硬页（限流/拉黑）解不了也等不来，别浪费验证码钱
+                        solvable = solve_captcha and capsolver_key and not hard
                         if solvable:
                             _progress(f"[W{worker_id}] 被拦({(title or 'challenge')[:30]})，尝试解验证码...")
                             if try_solve_challenge(page, upstream_proxy, capsolver_key, log=_progress):
                                 clean, title = page_status(page)
                                 _progress(f"[W{worker_id}] 验证码通过，继续采集")
                         if not clean:
-                            last_error = f"blocked: {title or 'challenge'}"
-                            _progress(f"[W{worker_id}] 被拦({(title or 'challenge')[:24]})，换 IP 重试")
+                            what = {"rate": "限流", "block": "拉黑"}.get(hard, "拦")
+                            last_error = f"{what}: {title or 'challenge'}"
+                            _progress(f"[W{worker_id}] 被{what}({(title or 'challenge')[:24]})，"
+                                      f"关掉浏览器重开换出口 IP")
                             browser.close()
+                            session = f"session_{int(time.time() * 1000) % 1000000}_{worker_id}"
                             continue
 
                     page.wait_for_timeout(1500)
@@ -997,6 +1040,10 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                             continue
                         eligible += 1
                         record, n = scrape_detail(page, person, address, now)
+                        if scrape_detail.hard_blocked:
+                            what = "限流" if scrape_detail.hard_blocked == "rate" else "拉黑"
+                            raise DetailHardBlocked(
+                                f"详情页被{what}，剩 {len(people) - i} 人没做")
                         if record:
                             saved += 1
                             phone_count += n
@@ -1016,6 +1063,15 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                                   "phones": phone_count, "list": len(people), "title": last_title,
                                   "traffic_kb": relay.bytes_transferred // 1024}
 
+                except DetailHardBlocked as exc:
+                    last_error = str(exc)
+                    _progress(f"[W{worker_id}] {exc} ⇒ 就地换 session 换不动出口"
+                              f"（隧道复用），关掉浏览器重开，从头做这个地址")
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    continue
                 except Exception as exc:
                     if relay.auth_failed:
                         last_error = "代理 407：niceproxy 账号余额不足/认证失败，请充值或换代理"

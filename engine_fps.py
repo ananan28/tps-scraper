@@ -56,7 +56,20 @@ HOME_TITLE = "free people search | fastpeoplesearch.com"
 NETERR_MARKERS = ("err_connection_closed", "err_connection_reset", "err_connection_refused",
                   "err_timed_out", "err_internet_disconnected", "err_socket_not_connected",
                   "err_network_changed", "err_empty_response", "err_name_not_resolved",
-                  "err_proxy_connection_failed", "err_tunnel_connection_failed")
+                  "err_proxy_connection_failed", "err_tunnel_connection_failed",
+                  "err_too_many_redirects")
+
+# 限流页/拉黑页签名（Temp\sourcescan\rate_hit 与 rate_hit2 归档的 31 份原件实扫定案）：
+# 这类页一个都不带 _cf_chl_opt，而真挑战页 11/11 都带 —— 所以它们不是「等一等就自过」的页面，
+# 同一条 IP 再等满 challenge_wait 也原样吐回来。旧判定把它们全认成 loading/challenge，
+# 每页白等 200 秒 × (换 IP 次数+1) ≈ 10 分钟，这就是「别的机器一开机就卡死」的真相。
+CHL_OPT_MARKER = "_cf_chl_opt"
+RATE_TITLE_MARKERS = ("rate limited", "too many requests")
+RATE_BODY_MARKERS = ("rate limit exceeded", "you have exceeded the amount of requests",
+                     "allotted time limit", "this ip has been rate limited")
+# CF 硬拒页：标题是 attention required 但正文写的是「你已经被拒」，不是「正在验证」
+HARD_BLOCK_MARKERS = ("sorry, you have been blocked", "you've been blocked",
+                      "you are unable to access")
 
 # 实测定案：只拦图片+媒体（按扩展名），字体/样式放行；全拦会把挑战摊薄弄坏
 BLOCK_URL_PATTERNS = ["*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.svg", "*.ico",
@@ -88,6 +101,13 @@ OFFSCREEN_ARGS = ["--window-position=-32000,-32000"]
 
 class FpsBlocked(RuntimeError):
     """验证页反复出现，换 IP 仍不通过 —— 绝不能当成『该地址查无此人』。"""
+
+
+class FpsNeedNewIp(RuntimeError):
+    """撞上限流/拉黑这种「再等多久都原样返回」的硬页。
+    实测同一副浏览器里 relay.set_session() 换 5 次 sid，出口 IP 一次没变（1/5 唯一，
+    隧道是复用的，改用户名只对新建隧道生效）—— 就地换 IP 是假的，
+    必须把这一轮整副浏览器废掉重开，才真换得到出口。"""
 
 
 # ---------------- 地址 → FPS 网址 ----------------
@@ -126,13 +146,30 @@ def _is_challenge(content):
     return any(k in text for k in CF_BODY_MARKERS)
 
 
+def _hard_page_state(text):
+    """限流/拉黑页返回 ratelimited / hardblock，其它返回 ""。
+    带 _cf_chl_opt 的一律不当硬页：那是会自过的真挑战，等是对的。"""
+    low = (text or "").lower()
+    if CHL_OPT_MARKER in low:
+        return ""
+    title = _title_of(low)
+    if any(k in title for k in RATE_TITLE_MARKERS) or any(k in low for k in RATE_BODY_MARKERS):
+        return "ratelimited"
+    if any(k in low for k in HARD_BLOCK_MARKERS):
+        return "hardblock"
+    return ""
+
+
 def page_state(content, kind="listing"):
-    """challenge=验证页 / bounced=被弹回首页 / neterror=出口断连报错页 /
-    loading=标题对了但内容还在流 / ready=内容到位"""
+    """challenge=验证页 / ratelimited=这 IP 被限流 / hardblock=这 IP 被拉黑 /
+    bounced=被弹回首页 / neterror=出口断连报错页 / loading=标题对了但内容还在流 / ready=内容到位"""
     text = content or ""
     low = text.lower()
     if any(k in low for k in NETERR_MARKERS):
         return "neterror"
+    hard = _hard_page_state(text)
+    if hard:
+        return hard
     if _is_challenge(text):
         return "challenge"
     if _title_of(text) == HOME_TITLE:
@@ -256,9 +293,11 @@ async def _clear_cookies(tab):
 
 
 async def _fetch(tab, relay, url, kind, log, timeout_s, rotations, sid_base):
-    """导航并等内容到位，等不住或被弹回首页就地换出口 IP 重试同一页（浏览器不重开）。
+    """导航并等内容到位；等不住/被弹回首页就在同一副浏览器里重载重试（注意：实测
+    relay.set_session 换 sid 换不动出口 IP，隧道复用，所以这里换的只是重载次数）。
 
-    返回 ""：换了 IP 还是被弹回首页 —— 这才是「这地址真没人」的唯一证据。
+    返回 ""：换着重载还是被弹回首页 —— 这才是「这地址真没人」的唯一证据。
+    抛 FpsNeedNewIp：撞上限流/拉黑硬页，必须整副浏览器重开才换得到 IP。
     抛 FpsBlocked：验证页压不住 —— 绝不能当成没人。
     """
     last_err = ""
@@ -284,21 +323,34 @@ async def _fetch(tab, relay, url, kind, log, timeout_s, rotations, sid_base):
                                  if k in (content or "").lower()), "NETERR")
                     last_err = f"出口断连 {code}"
                     log(f"页面报 {code}（出口死口，不是这地址没人）"
-                        f"，不等了直接换新 IP（{relay.bytes_transferred // 1024}KB）")
+                        f"，不等了直接重载重试（{relay.bytes_transferred // 1024}KB）")
                     break
+                if state in ("ratelimited", "hardblock"):
+                    # 立刻再看一眼确认（只有可能是半加载撞字样时才会翻案），是硬页就绝不等：
+                    # 这两类页不带 _cf_chl_opt，不是会自过的挑战，等到天黑也原样返回。
+                    again = await _content(tab)
+                    state2 = page_state(again, kind)
+                    if state2 == state:
+                        raise FpsNeedNewIp(
+                            f"出口 IP 被{'限流' if state == 'ratelimited' else '拉黑'}"
+                            f"（标题『{_title_of(content)[:26]}』 {len(content or '')} 字节，"
+                            f"{relay.bytes_transferred // 1024}KB）")
+                    content, state = again, state2
+                    if state == "ready":
+                        return content
                 if state != last_state:
                     log(f"这页内容还没到位（{state} {len(content or '')} 字节，"
                         f"标题『{_title_of(content)[:40]}』）")
                     last_state = state
                 if time.time() - t0 >= timeout_s:
                     last_err = f"{int(time.time() - t0)} 秒没出内容（{state}）"
-                    log(f"{last_err}，换新 IP（{relay.bytes_transferred // 1024}KB）")
+                    log(f"{last_err}，同出口重载重试（{relay.bytes_transferred // 1024}KB）")
                     break
                 await asyncio.sleep(4)
         if rot >= rotations:
             if last_err == "被弹回首页":
                 return ""
-            raise FpsBlocked(f"{last_err}，换了 {rot} 次 IP 仍不行")
+            raise FpsBlocked(f"{last_err}，同一条出口重载 {rot + 1} 次仍不行")
         sid = f"{sid_base}_{rot + 1}"
         relay.set_session(sid)
         await _clear_cookies(tab)
@@ -327,7 +379,9 @@ def _sticky_template(proxy_template):
     if ":" not in cred:
         raise RuntimeError(f"代理缺密码：{proxy_template}")
     user, pwd = cred.split(":", 1)
-    user = re.sub(r"-sid-[^-]*-t-\d+", f"-sid-{{session}}-t-{sticky_min}", user)
+    # 实测坑：旧正则 -sid-[^-]*-t-\d+ 匹配不了带横杠的 sid（如 sid-AB-C123-t-30），
+    # 整条原样留下 ⇒ 所有车道共用同一个写死的 sid ⇒ 厂商只给一个出口 IP ⇒ 一开机就成片限流。
+    user = re.sub(r"-sid-.+?(?:-t-\d+|$)", f"-sid-{{session}}-t-{sticky_min}", user, count=1)
     if "-sid-" not in user:
         user = f"{user}-sid-{{session}}-t-{sticky_min}"
     return f"{scheme}://{user}:{pwd}@{host}"
@@ -585,7 +639,7 @@ async def _run_attempt(address, url, relay, opt):
                 c["pages"] += 1
                 if content == "":
                     # 换过 IP 还是被弹回首页：这才允许判这个地址没人
-                    _log(f"空(FPS): 换了 {opt['rotations']} 次出口 IP 都被弹回首页"
+                    _log(f"空(FPS): 同一条出口重载 {opt['rotations'] + 1} 次都被弹回首页"
                          f"（卡片{c['cards']}张，流量{relay.bytes_transferred // 1024}KB）")
                     return "nodata", c, [], "换IP复测仍弹回首页"
                 found = parse_listing(content, listing_url)
@@ -613,6 +667,9 @@ async def _run_attempt(address, url, relay, opt):
                 if not nxt:
                     break
                 listing_url = nxt
+        except FpsNeedNewIp as exc:
+            kind, err = "blocked", str(exc)
+            _log(f"{exc} ⇒ 就地换 IP 换不动（隧道复用），整副浏览器重开换新出口")
         except FpsBlocked as exc:
             kind, err = "blocked", str(exc)
 
@@ -637,9 +694,13 @@ async def _run_attempt(address, url, relay, opt):
             try:
                 content = await _fetch(tab, relay, person["link"], "person", _log,
                                        opt["challenge_wait"], opt["rotations"], opt["sid"])
+            except FpsNeedNewIp as exc:
+                kind, err = "blocked", str(exc)
+                _log(f"{exc} ⇒ 整副浏览器重开换新出口，剩 {len(pending)} 人从这个人接着做")
+                break
             except FpsBlocked as exc:
                 kind, err = "blocked", str(exc)
-                _log(f"个人页验证压不住：{exc}，换新 IP 续做剩余 {len(pending)} 人")
+                _log(f"个人页压不住：{exc}，换新 IP 续做剩余 {len(pending)} 人")
                 break
             if content == "":
                 # 个人页被弹回首页：这既不是「地址没人」也不是「这人没号」，是出口 IP 被弹。
@@ -714,7 +775,7 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
         _log(f"✗ {exc}")
         with connect() as con:
             con.execute("UPDATE addresses SET status='failed',error=?,updated_at=? WHERE address=?",
-                        (str(exc), now))
+                        (str(exc), now, address))
         return False, {"error": str(exc)}
 
     _log(f"开始(FPS): {address[:40]}")
@@ -766,10 +827,11 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
         if kind == "nodata":
             nodata_rounds += 1
             if nodata_rounds < confirm_nodata:
-                _log(f"这轮 {opt['rotations'] + 1} 个出口 IP 都被弹回首页——先不判「没人」，"
-                     f"换新浏览器+新 IP 再复测（第 {nodata_rounds}/{confirm_nodata} 轮）")
+                _log(f"这轮同一条出口重载 {opt['rotations'] + 1} 次都被弹回首页——先不判「没人」，"
+                     f"换新浏览器+新出口 IP 再复测（第 {nodata_rounds}/{confirm_nodata} 轮）")
                 continue
-            why = f"换 IP 复测 {nodata_rounds} 轮（共 {(opt['rotations'] + 1) * nodata_rounds} 个出口）仍弹回首页"
+            why = (f"换浏览器复测 {nodata_rounds} 轮（{nodata_rounds} 个出口 IP，"
+                   f"每出口重载 {opt['rotations'] + 1} 次）仍弹回首页")
             with connect() as con:
                 con.execute("UPDATE addresses SET status='nodata',records=0,people=0,"
                             "phones=0,traffic_kb=?,error=?,updated_at=?"
@@ -810,5 +872,5 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
     _log(f"✗ {max_attempts}次全部失败: {last_error}")
     with connect() as con:
         con.execute("UPDATE addresses SET status='failed',error=?,updated_at=? WHERE address=?",
-                    (last_error[:300], datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                    (last_error[:300], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), address))
     return False, {"error": last_error, "title": "fastpeoplesearch"}
