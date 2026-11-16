@@ -639,6 +639,9 @@ class Main(QMainWindow):
         self._closing = True
         self.running = False
         self._stats_timer.stop()
+        # 内存写队列里最后那几个人必须真落盘再收浏览器（写线程是 daemon，不叫它它就带着数据走了）
+        if not eng_tps.stop_writer(6):
+            self.log("关闭：写库队列 6 秒没排空，最后几个人可能没进库")
         eng_fps.begin_shutdown()
         self._allow_sleep()
         killed = eng_fps.kill_browser_tree(os.getpid())

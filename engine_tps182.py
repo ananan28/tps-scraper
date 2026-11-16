@@ -2,6 +2,7 @@
 """TPS 抓取引擎"""
 import base64
 import csv
+import queue
 import re
 import socket
 import sqlite3
@@ -58,12 +59,161 @@ def connect():
     con = sqlite3.connect(str(DB_PATH), timeout=60)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
-    # 添加流量统计字段（如果不存在）
-    try:
-        con.execute("ALTER TABLE addresses ADD COLUMN traffic_kb INTEGER DEFAULT 0")
-    except Exception:
-        pass
     return con
+
+
+# ---------------- 落库：抓取线程只往内存队列塞，一条专职线程攒批写 ----------------
+# 实测（20 车道 × 每人一次 connect()+一次提交）：平均 26.85ms、p95 20.88ms、最差 4,348ms，
+# 全是十几条车道抢 WAL 那一把写锁抢出来的；换成「一条常驻连接 + 攒 1 秒一次提交」后，
+# 抓取线程这边排队等待 0 秒，写盘再慢也不挡个人页。
+# 断电最多丢最后没提交的那一批（秒级），丢的人在表里还是 pending，重跑会重新采到，
+# 语句本身带「只有真拿到号码才覆盖」，重采不会把已有号码抹掉。
+_PERSON_SQL = ("INSERT INTO results(address,name,age,location,phones,created_at,nphone,agenum)"
+               " VALUES(?,?,?,?,?,?,?,?)"
+               " ON CONFLICT(address,name,age) DO UPDATE SET"
+               " location=excluded.location, phones=excluded.phones,"
+               " created_at=excluded.created_at, nphone=excluded.nphone,"
+               " agenum=excluded.agenum WHERE excluded.phones<>''")
+WRITE_QUEUED = WRITE_OK = WRITE_BAD = 0
+_WRITE_ERR = ""
+_write_q = queue.Queue()
+_write_stop = threading.Event()
+_write_thread = None
+_write_lock = threading.Lock()
+WRITE_PERSIST_S = 1.0
+
+
+def _writer_loop():
+    con, con_db, batch = None, "", []
+    try:
+        while True:
+            if not batch:
+                try:
+                    batch = [_write_q.get(timeout=WRITE_PERSIST_S)]
+                except queue.Empty:
+                    if _write_stop.is_set() and not _write_q.unfinished_tasks:
+                        break
+                    continue
+                deadline = time.time() + WRITE_PERSIST_S
+                while len(batch) < 5000:
+                    try:
+                        batch.append(_write_q.get(timeout=max(0.0, deadline - time.time())))
+                    except queue.Empty:
+                        break
+            # 常驻连接不能钉死在第一次打开的那个库上：DB_PATH 一旦换了，还往旧文件写
+            # 就是「界面读新库、人全在旧库」——两边都看不见，纯属丢数据（测试里真踩到了）。
+            if con is not None and con_db != str(DB_PATH):
+                con.close()
+                con = None
+            if con is None:
+                try:
+                    con = connect()
+                    con_db = str(DB_PATH)
+                except Exception as exc:
+                    _fail(batch, f"写线程开库失败 {type(exc).__name__}: {str(exc)[:120]}")
+                    batch = []
+                    continue
+            _commit(batch, con)
+            batch = []
+    finally:
+        if con is not None:
+            con.close()                 # 退出才真关，平时一条挂着不撒
+
+
+def _fail(batch, err):
+    """这批人没写进去：计数、留错误、把队列的账清掉，绝不让队列永远挂着。"""
+    global WRITE_BAD, _WRITE_ERR
+    WRITE_BAD += len(batch)
+    _WRITE_ERR = err
+    for _ in batch:
+        _write_q.task_done()
+
+
+def _commit(batch, con):
+    global WRITE_OK
+    try:
+        with con:
+            con.executemany(_PERSON_SQL, batch)
+        WRITE_OK += len(batch)
+    except Exception as exc:
+        _fail(batch, f"{type(exc).__name__}: {str(exc)[:120]}")
+        return
+    for _ in batch:
+        _write_q.task_done()
+
+
+def start_writer():
+    """幂等起写线程：线程还活着就别动它（尤其别在停止流程里把 stop 标志擦掉）。"""
+    global _write_thread
+    with _write_lock:
+        if _write_thread and _write_thread.is_alive():
+            return
+        _write_stop.clear()
+        _write_thread = threading.Thread(target=_writer_loop, daemon=True, name="dbwriter")
+        _write_thread.start()
+
+
+def write_person(args):
+    """把一个人交给写线程，立刻返回（抓取路径不再等 SQLite）。
+    顺手把「号码几个」「年龄几岁」两个整数存进表里：界面统计直接对整数列求和，
+    不用再每 3 秒把整张表读出来逐行数（40 万行实测：逐行 1459ms/次 vs 整数列 70ms/次）。
+    两个整数就是用导出同一套 _age_cell / 同一种切段算法算的，统计和导出必然一模一样。"""
+    global WRITE_QUEUED
+    start_writer()
+    row = list(args)
+    row[4] = ",".join(p for p in str(row[4] or "").replace("|", ",").split(",") if p.strip())
+    row += _tally(row[2], row[4])
+    _write_q.put(tuple(row))
+    WRITE_QUEUED += 1
+
+
+def _tally(age, phones):
+    """(号码个数, 有效年龄或 NULL)：与 _passes_age / 导出用的判定同一个来源。
+    号码个数照旧写法逐段数（'|' 也算分隔），老库回填时列里可能就是脏串。"""
+    _, a = _age_cell(age)
+    return len([p for p in str(phones or "").replace("|", ",").split(",") if p.strip()]), a
+
+
+def flush_writes(timeout=30):
+    """等队列真落盘（地址收尾、导出、停止、关窗之前都要叫一次）。返回是否排空。"""
+    start_writer()      # 写线程万一早就死了（比如开库就报错），这里把它捞回来，别干等 30 秒
+    deadline = time.time() + timeout
+    while _write_q.unfinished_tasks and time.time() < deadline:
+        time.sleep(0.02)
+    return not _write_q.unfinished_tasks
+
+
+def stop_writer(timeout=10):
+    """收尾：先把在途的写完，再让线程退出（关窗、停止用）。返回是否排空。
+    顺序不能反：先置 stop 的话，flush 里为捞线程会幂等 start_writer，反而把 stop 擦了。"""
+    ok = flush_writes(timeout)
+    _write_stop.set()
+    t = _write_thread
+    if t and t.is_alive():
+        t.join(3)
+    return ok
+
+
+def _migrate_tally(con):
+    """老库里补上「号码个数 / 有效年龄」两列，用的还是 _tally 那一套 Python 判定
+    （SQL 自己数逗号会把 '|'、空段数错，所以逐行算一遍再写回）。只在开库时跑一次。"""
+    have = [r[1] for r in con.execute("PRAGMA table_info(results)")]
+    for col in ("nphone", "agenum"):
+        if col not in have:
+            con.execute(f"ALTER TABLE results ADD COLUMN {col} INTEGER")
+    last_id = 0
+    while True:
+        rows = con.execute("SELECT id,age,phones FROM results WHERE id>? AND "
+                           "(nphone IS NULL OR agenum IS NULL) ORDER BY id LIMIT 50000",
+                           (last_id,)).fetchall()
+        if not rows:
+            break
+        with con:
+            con.executemany("UPDATE results SET nphone=?,agenum=? WHERE id=?",
+                            [(n, a, r["id"]) for r in rows
+                             for n, a in [_tally(r["age"], r["phones"])]])
+        last_id = rows[-1]["id"]
+    con.execute("CREATE INDEX IF NOT EXISTS idx_r_stat ON results(nphone,agenum)")
 
 
 def init_db():
@@ -90,7 +240,9 @@ def init_db():
             age TEXT,
             location TEXT,
             phones TEXT,
-            created_at TEXT
+            created_at TEXT,
+            nphone INTEGER,
+            agenum INTEGER
         )""")
         con.execute("CREATE INDEX IF NOT EXISTS idx_results_created ON results(created_at DESC)")
         con.execute("""DELETE FROM results WHERE id NOT IN
@@ -99,6 +251,7 @@ def init_db():
             con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_results_unique ON results(address,name,age)")
         except sqlite3.Error:
             pass
+        _migrate_tally(con)
         con.execute("""CREATE TABLE IF NOT EXISTS settings(
             key TEXT PRIMARY KEY,
             value TEXT
@@ -135,22 +288,30 @@ def import_addresses(lines):
 
 
 def stats():
+    """统计全交给 SQLite 对两个整数列求和，一行都不往 Python 里拷。
+    旧写法每 3 秒把整张 results fetchall 出来逐行数（40 万行实测 1459ms、峰值 77MB），
+    库越大界面越卡；现在实测 70ms、峰值 0MB，口径由 _tally 与导出同源保证一致。"""
+    flush_writes()       # 内存队列里还没落盘的人也得算进去：显示要等于到手
+    lo = int(get_setting("min_age", MIN_AGE))
+    hi = int(get_setting("max_age", MAX_AGE))
     with connect() as con:
         out = {}
         for st, n in con.execute("SELECT status,COUNT(*) FROM addresses GROUP BY status"):
             out[st] = n
-        out["results"] = con.execute("SELECT COUNT(*) FROM results").fetchone()[0]
-        lo = int(get_setting("min_age", MIN_AGE))
-        hi = int(get_setting("max_age", MAX_AGE))
-        rows = con.execute("SELECT COALESCE(phones,''),COALESCE(age,'') FROM results").fetchall()
+        out["traffic_kb"] = int(con.execute(
+            "SELECT COALESCE(SUM(traffic_kb),0) FROM addresses").fetchone()[0] or 0)
+        r = con.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(nphone),0) phones, "
+            "COALESCE(SUM(nphone>0),0) with_phone, "
+            "COALESCE(SUM(CASE WHEN agenum IS NULL OR agenum BETWEEN ? AND ? "
+            "THEN 1 ELSE 0 END),0) deliver FROM results", (lo, hi)).fetchone()
         # 「全部号码」= 所有人名下号码个数（一人能有十几个）；
         # 「导出条数」= 现在这版表真会写出的行数（一人一行，取第一个常用号）。
         # 两个都摆出来，别拿一个数当另一个用。
-        out["phones"] = sum(len([p for p in str(r[0]).replace("|", ",").split(",") if p.strip()])
-                            for r in rows)
-        out["deliver"] = sum(1 for r in rows if _passes_age(r[1], lo, hi))
-        out["with_phone"] = sum(1 for r in rows if str(r[0]).strip())
-        out["traffic_kb"] = int(con.execute("SELECT COALESCE(SUM(traffic_kb),0) FROM addresses").fetchone()[0] or 0)
+        out["results"] = r["n"]
+        out["phones"] = int(r["phones"] or 0)
+        out["with_phone"] = int(r["with_phone"] or 0)
+        out["deliver"] = int(r["deliver"] or 0)
     for key in ("pending", "running", "done", "failed"):
         out.setdefault(key, 0)
     return out
@@ -185,6 +346,7 @@ def export_csv(path=None):
     """导出：一人一行，电话只给第一个（页面上排最前那个 = 常用号）。
     其余号码仍留在库里（界面「全部号码」数的是全部），要全导随时能再出。"""
     from engine_core import gender_bucket
+    flush_writes()                      # 内存队列里还没落盘的人必须先写完再导，否则导出少行
     lo = int(get_setting("min_age", MIN_AGE))
     hi = int(get_setting("max_age", MAX_AGE))
     gender_label = {"male": "男", "female": "女", "andy": "中性", "unknown": "未知"}
@@ -838,17 +1000,10 @@ def scrape_detail(page, person, address, now):
             "location": location,
             "phones": ",".join(phones),
         }
-        with connect() as con:
-            # 同一个人（地址+姓名+年龄）重复采到时：只有这次真拿到号码才覆盖，
-            # 否则一次「没号码的重扫」会把已经存下的号码抹掉 —— 这就是电话数掉回 0 的机制。
-            con.execute("INSERT INTO results(address,name,age,location,phones,created_at)"
-                        " VALUES(?,?,?,?,?,?)"
-                        " ON CONFLICT(address,name,age) DO UPDATE SET"
-                        " location=excluded.location, phones=excluded.phones,"
-                        " created_at=excluded.created_at"
-                        " WHERE excluded.phones<>''",
-                        (address, record["name"], record["age"], record["location"],
-                         record["phones"], now))
+        # 同一个人（地址+姓名+年龄）重复采到时：只有这次真拿到号码才覆盖，
+        # 否则一次「没号码的重扫」会把已经存下的号码抹掉 —— 这就是电话数掉回 0 的机制。
+        write_person((address, record["name"], record["age"], record["location"],
+                      record["phones"], now))
         return record, len(phones)
     except Exception:
         return None, 0
@@ -1053,7 +1208,7 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                         time.sleep(0.1)
 
                     browser.close()
-
+                    flush_writes()      # 排队的人先真落盘，再写地址状态：显示要等于到手
                     with connect() as con:
                         con.execute(
                             "UPDATE addresses SET status='done',records=?,people=?,phones=?,traffic_kb=?,error='',updated_at=? WHERE address=?",

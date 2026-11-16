@@ -730,16 +730,11 @@ async def _run_attempt(address, url, relay, opt):
                      f"{opt['min_age']}-{opt['max_age']}，不入库")
                 continue
             phones = [p for p in rec["phones"].split(",") if p.strip()]
-            with connect() as con:
-                # 同一个人重复采到：只有这次真拿到号码才覆盖，防止无号重扫把号码抹掉
-                con.execute("INSERT INTO results"
-                            "(address,name,age,location,phones,created_at) VALUES(?,?,?,?,?,?)"
-                            " ON CONFLICT(address,name,age) DO UPDATE SET"
-                            " location=excluded.location, phones=excluded.phones,"
-                            " created_at=excluded.created_at"
-                            " WHERE excluded.phones<>''",
-                            (address, rec["name"], rec["age"], rec["location"],
-                             rec["phones"], now))
+            # 同一个人重复采到：只有这次真拿到号码才覆盖，防止无号重扫把号码抹掉。
+            # 抓取线程只把人交给专职写线程（实测每人开一次连接抢写锁，最差能拖到 4.3 秒）
+            # 入库就用这个剔过空段的同一个列表拼的串：界面「号码N个」必须等于库里的段数
+            tps.write_person((address, rec["name"], rec["age"], rec["location"],
+                              ",".join(phones), now))
             c["saved"] += 1
             c["phones"] += len(phones)
             if not phones:
@@ -812,6 +807,7 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
         session = f"fps{int(time.time() * 1000) % 1000000}_{worker_id}_{attempt}"
         relay = _open_relay(proxy_template, proxy_pass, session)
         opt["sid"] = session
+        bad0 = tps.WRITE_BAD
         _log(f"第{attempt + 1}/{max_attempts}次尝试，出口 session={session}")
         try:
             kind, c, pending, err = asyncio.run(_run_attempt(address, url, relay, opt))
@@ -823,6 +819,11 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
             totals[k] += c.get(k, 0)
         traffic_kb = max(traffic_kb, relay.bytes_transferred // 1024)
         relay.stop()
+        # 这一轮采到的人得先真落盘，再往 addresses 写状态/计数：显示要等于到手
+        if not tps.flush_writes():
+            _log("[!] 写库队列 30 秒没排空，库里可能少于界面数")
+        if tps.WRITE_BAD > bad0:
+            _log(f"[!] 写库失败{tps.WRITE_BAD - bad0}条：{tps._WRITE_ERR}")
 
         if kind == "nodata":
             nodata_rounds += 1
