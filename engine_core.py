@@ -168,6 +168,15 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT
         )""")
+        # 出口 IP → 中文归属地缓存（只为日志那一行）：key 既放精确 IP，也放它所属 /24
+        # （住宅池新号多半还在同几个 /24 里，命中就不用再打 ip-api，免费档限 ~45 次/分）。
+        con.execute("""CREATE TABLE IF NOT EXISTS ip_geo(
+            key TEXT PRIMARY KEY,
+            ip TEXT,
+            loc TEXT,
+            is_net INTEGER DEFAULT 0,
+            ts INTEGER
+        )""")
         con.execute("UPDATE addresses SET status='pending' WHERE status='running'")
 
 

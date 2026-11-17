@@ -17,6 +17,8 @@ import requests
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
+import egress_ip as egress     # 只给日志用：这条车道当前出口 IP + 归属地（标准库，不拖依赖）
+
 # 打包(frozen)时：Windows 数据放 EXE 同级目录；macOS 放 ~/Library/Application Support（.app 包内不宜写库）；源码运行放脚本目录
 if getattr(sys, "frozen", False):
     if sys.platform == "darwin":
@@ -1126,6 +1128,18 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                         return
                     route.continue_()
                 page.route("**/*", _block_request)
+                # 每条车道的出口落到哪里：浏览器一起来就先读一次出口 IP + 归属地。
+                # 代理写法带 sid（粘性）时先用 Python 走同一个 sid 的上游读（超时说话算数，
+                # <=3.5 秒）；不粘性时厂家每个连接给随机号，那样读出来的不是这条车道在用的号，
+                # 就只让浏览器自己在隧道里读。取不到最多损失一行日志，不影响这一轮抓取。
+                try:
+                    _egress = egress.probe_sync(
+                        page, session,
+                        upstream_proxy if egress.is_sticky(proxy_template) else "")
+                    if _egress:
+                        _progress(f"[W{worker_id}] {_egress}")
+                except Exception:
+                    pass
 
                 try:
                     _progress(f"[W{worker_id}] 加载列表页...")

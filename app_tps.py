@@ -256,6 +256,21 @@ class Main(QMainWindow):
             "被拦时解验证码（默认开）。\n关＝只换 IP 不解码，TPS 核心大概率拿不到号码；FPS 核心用不上这个。")
         self.solve_captcha_check.setChecked(eng.get_setting("solve_captcha", "1") == "1")
         concurrency_row.addWidget(self.solve_captcha_check)
+        # 出口 IP 落日志：开跑时每条车道都写明「现在这个出口是哪个 IP、在哪个国家/州」，
+        # 排查「这台机器打不开页」到底怪线路还是怪本机时就看这一行。实测归属地接口
+        # ip-api 免费档限 ~45 次/分，所以查过的进 ip_geo 表缓存（7 天）+ 按 /24 复用。
+        self.egress_check = QCheckBox("日志写出口IP")
+        self.egress_check.setToolTip(
+            "每副浏览器一开起来，就在它自己的代理隧道里读一次出口 IP，并查它落在哪个国家/州，"
+            "写进行首 [W3] 出口 …\n"
+            "只能读浏览器隧道里的 IP —— 本机直连读到的永远是这台电脑自己的出口，"
+            "看不到代理按 session 绑住的那个。\n"
+            "代理栏留空（直连）时不找隧道，直接写本机出口＋本机归属地，一个额外标签页都不开。\n"
+            "取不到只写「没读到」，不影响抓取；探活有硬上限，实测正常 1.4~2.1 秒一条车道，"
+            "出口死口时最多 6 秒（11-18 六地址对撞：31 人/296 号与关掉时一字不差）。\n"
+            "关了就一个额外请求都不发、一个额外标签页都不开。")
+        self.egress_check.setChecked(eng.get_setting("log_egress_ip", "1") == "1")
+        concurrency_row.addWidget(self.egress_check)
         concurrency_row.addStretch()
         config_layout.addLayout(concurrency_row)
 
@@ -627,6 +642,7 @@ class Main(QMainWindow):
         eng.set_setting("concurrency", self.concurrency_input.value())
         eng.set_setting("max_attempts", self.retry_input.value())
         eng.set_setting("solve_captcha", "1" if self.solve_captcha_check.isChecked() else "0")
+        eng.set_setting("log_egress_ip", "1" if self.egress_check.isChecked() else "0")
         eng.set_setting("fps_max_persons", self.fps_persons_input.value())
         eng.set_setting("fps_max_pages", self.fps_pages_input.value())
         eng.set_setting("fps_headless", "0" if self.fps_window_check.isChecked() else "1")
@@ -716,6 +732,7 @@ class Main(QMainWindow):
         eng.set_setting("capsolver", capsolver)
         eng.set_setting("concurrency", concurrency)
         eng.set_setting("solve_captcha", "1" if solve_captcha else "0")
+        eng.set_setting("log_egress_ip", "1" if self.egress_check.isChecked() else "0")
         max_attempts = self.retry_input.value()
         eng.set_setting("max_attempts", max_attempts)
         # FPS 那几格引擎是直接从库里读的，不点「保存配置」也得按面板走
@@ -730,7 +747,8 @@ class Main(QMainWindow):
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
-        self.log(f"启动，并发 {concurrency}，解验证码={'开' if solve_captcha else '关（被拦换IP）'}")
+        self.log(f"启动，并发 {concurrency}，解验证码={'开' if solve_captcha else '关（被拦换IP）'}，"
+                 f"出口IP日志={'开' if self.egress_check.isChecked() else '关'}")
 
         def work():
             try:

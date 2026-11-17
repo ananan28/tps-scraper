@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import engine_tps182 as tps          # 库/转发器/统计/导出全部复用 1.8.2 那套
+import egress_ip as egress           # 只给日志用：这条车道当前出口 IP + 归属地
 from engine_core import gender_bucket
 
 DB_PATH = tps.DB_PATH
@@ -679,6 +680,19 @@ async def _open_browser(relay, headless, log, hide=False):
     return browser, tab
 
 
+async def _log_egress(browser, _log, opt):
+    """浏览器一起来就把这条车道真正在用的出口 IP + 归属地写进日志。
+    先用 Python 走同一个 sid 的上游读（超时说话算数，读不到才退回临时标签页让浏览器自己读），
+    归属地缓存在 ip_geo 表。取不到最多损失一行日志，绝不影响这一轮抓取，所以整段吞异常；
+    界面把「日志写出口IP」取消勾选时这里直接返回空串，一个额外请求都不发。"""
+    try:
+        msg = await egress.probe_async(browser, opt.get("sid", ""), opt.get("upstream", ""))
+    except Exception:
+        return
+    if msg:
+        _log(msg)
+
+
 async def _run_attempt(address, url, relay, opt):
     """跑一轮（一个浏览器）。返回 (kind, 计数字典, 剩余待做的人, 错因)。
     kind: done/blocked/nodata/error"""
@@ -695,6 +709,7 @@ async def _run_attempt(address, url, relay, opt):
     err = ""
     try:
         browser, tab = await _open_browser(relay, headless, _log, opt.get("hide", False))
+        await _log_egress(browser, _log, opt)
 
         # ===== 列表页（含翻页）=====
         listing_url = url
@@ -923,6 +938,9 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
         session = f"fps{int(time.time() * 1000) % 1000000}_{worker_id}_{attempt}"
         relay = _open_relay(proxy_template, proxy_pass, session)
         opt["sid"] = session
+        # 探活用的上游串：和浏览器同一个 sid，Python 自己 CONNECT 一次就能读到这条车道的出口
+        opt["upstream"] = tps.build_upstream_proxy(_sticky_template(proxy_template),
+                                                   proxy_pass, session)
         bad0 = tps.WRITE_BAD
         _log(f"第{attempt + 1}/{max_attempts}次尝试，出口 session={session}")
         try:
