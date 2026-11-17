@@ -42,6 +42,32 @@ def core_name():
 
 BASE = Path(__file__).resolve().parent
 
+# 界面日志只留最近 200 行（省内存），所以每条都得同时写进 EXE 同级的 logs\ 文件里，
+# 否则一关窗口全没了、事后没法复盘。放 EXE 同级而不是 _internal 里：
+# 覆盖升级的 bat 会 rd /s /q _internal，库和日志都得躲开那一刀。
+_LOG_DIR = eng_tps.BASE / "logs"
+_log_file = [None]
+_log_fh = [None]
+
+
+def log_path():
+    """本次运行的日志文件路径（第一次写时才创建）。"""
+    if _log_file[0] is None:
+        _LOG_DIR.mkdir(exist_ok=True)
+        name = f"运行_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        _log_file[0] = _LOG_DIR / name
+        # 按行缓冲：程序被强杀也基本不丢；10 车道一起刷的时候不至于每条都开一次文件
+        _log_fh[0] = open(_log_file[0], "a", encoding="utf-8", buffering=1)
+    return _log_file[0]
+
+
+def write_log_file(line):
+    try:
+        log_path()
+        _log_fh[0].write(line + "\n")
+    except OSError:
+        pass
+
 
 class Bridge(QObject):
     log = Signal(str)
@@ -112,7 +138,7 @@ class Main(QMainWindow):
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self.refresh)
         self._stats_timer.start(3000)
-        self.log("就绪")
+        self.log(f"就绪｜日志边写边存：{log_path()}（界面只显 200 行，文件里全程都在，程序自己从不删）")
 
     def build(self):
         central = QWidget()
@@ -197,6 +223,64 @@ class Main(QMainWindow):
         concurrency_row.addStretch()
         config_layout.addLayout(concurrency_row)
 
+        # 采集范围：年龄上下限两个核心都吃；换IP上限/验证等待只有 FPS 核心读。
+        # 这几格在早先只装 FPS 的界面（app_ui.py）里本来就有，合并成两核心界面时整块丢了
+        # —— 引擎一直在读 settings 里的 min_age/max_age/fps_rotations/challenge_wait，
+        #    界面没入口就等于被写死在默认值上，用户改不了。现在接回来。
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("年龄下限:"))
+        self.min_age_input = QSpinBox()
+        self.min_age_input.setRange(0, 120)
+        self.min_age_input.setValue(int(eng.get_setting("min_age", eng_tps.MIN_AGE)))
+        self.min_age_input.setToolTip(
+            "只保留年龄 ≥ 这个值的人。列表页没写年龄的照收（当未知，不卡）。\n"
+            "抓取时按它拦人，导出 CSV 也按同一个范围筛。\n"
+            "这个值只影响「留不留」，不影响抓得动抓不动。")
+        range_row.addWidget(self.min_age_input)
+        range_row.addWidget(QLabel("上限:"))
+        self.max_age_input = QSpinBox()
+        self.max_age_input.setRange(0, 120)
+        self.max_age_input.setValue(int(eng.get_setting("max_age", eng_tps.MAX_AGE)))
+        self.max_age_input.setToolTip(
+            "只保留年龄 ≤ 这个值的人，默认 85，再高一般是网站录错。\n"
+            "个人页年龄和列表年龄打架时以个人页为准（实测冒过 103、113 岁）。")
+        range_row.addWidget(self.max_age_input)
+        range_row.addWidget(QLabel("换IP上限:"))
+        self.max_rotations_input = QSpinBox()
+        self.max_rotations_input.setRange(0, 20)
+        self.max_rotations_input.setValue(int(eng.get_setting("fps_rotations", 2)))
+        self.max_rotations_input.setToolTip(
+            "仅 FPS 核心：同一条出口在一个页面上重载几次还不动，才判这条出口死了去换 IP。\n"
+            "调大 = 在同一副出口上多试，慢但少费流量；调小 = 快点换 IP。")
+        range_row.addWidget(self.max_rotations_input)
+        range_row.addWidget(QLabel("验证等待:"))
+        self.challenge_wait_input = QSpinBox()
+        self.challenge_wait_input.setRange(20, 600)
+        self.challenge_wait_input.setSuffix(" 秒")
+        self.challenge_wait_input.setValue(int(eng.get_setting("challenge_wait", 200)))
+        self.challenge_wait_input.setToolTip(
+            "仅 FPS 核心：撞上 Cloudflare 验证页最多等它自己过去多少秒（实测自过 56~165 秒）。\n"
+            "等满还没过才重开浏览器换出口。限流页/拉黑页/站点确认页不吃这个数，认出就走。")
+        range_row.addWidget(self.challenge_wait_input)
+        range_row.addStretch()
+        config_layout.addLayout(range_row)
+
+        # 保留性别：勾哪类留哪类（要女性就勾「女」）。按离线姓名库 user_names.json 判定。
+        gender_row = QHBoxLayout()
+        gender_row.addWidget(QLabel("保留性别:"))
+        self.gender_checks = {}
+        saved_genders = set(str(eng.get_setting("keep_genders", "male,andy,unknown")).split(","))
+        for key, label in (("male", "男"), ("female", "女"), ("andy", "中性"), ("unknown", "未知")):
+            cb = QCheckBox(label)
+            cb.setChecked(key in saved_genders)
+            cb.setToolTip(
+                f"保留「{label}」这一类人。只有勾选的类别才会进个人页花钱花时间抓。\n"
+                "中性 = 男女同名；未知 = 姓名库里查不到。女性按你的口径默认不勾。")
+            self.gender_checks[key] = cb
+            gender_row.addWidget(cb)
+        gender_row.addStretch()
+        config_layout.addLayout(gender_row)
+
         # FPS 抓取范围（只影响 FPS 核心）
         fps_row = QHBoxLayout()
         fps_row.addWidget(QLabel("人数:"))
@@ -226,7 +310,11 @@ class Main(QMainWindow):
         fps_row.addStretch()
         config_layout.addLayout(fps_row)
         self.fps_inputs = (self.fps_persons_input, self.fps_pages_input,
-                           self.fps_window_check, self.fps_hide_check)
+                           self.fps_window_check, self.fps_hide_check,
+                           # 换IP上限/验证等待/保留性别只有 FPS 核心读，切到 TPS 就灰掉，
+                           # 免得摆一格看着能调、实际引擎根本不看
+                           self.max_rotations_input, self.challenge_wait_input,
+                           *self.gender_checks.values())
 
         # 防睡眠 + 保存
         sleep_row = QHBoxLayout()
@@ -305,6 +393,9 @@ class Main(QMainWindow):
                                 ("已完成", ("done",))):
             act = menu.addAction(label)
             act.triggered.connect(lambda _=False, s=statuses, t=label: self.export_addrs(s, t))
+        menu.addSeparator()
+        act = menu.addAction("没有数据的地址（跑过但 0 人）")
+        act.triggered.connect(lambda: self.export_addrs(None, "没有数据"))
         self.addr_btn.setMenu(menu)
         data_row.addWidget(self.addr_btn)
 
@@ -400,10 +491,13 @@ class Main(QMainWindow):
         self._apply_core()
 
     def log(self, msg):
+        line = ""
         try:
             timestamp = datetime.now().strftime("%H:%M:%S")
-            self.log_box.append(f"[{timestamp}] {msg}")
-            # 日志最多保留 200 行，超了自动删旧的
+            line = f"[{timestamp}] {msg}"
+            write_log_file(line)
+            self.log_box.append(line)
+            # 界面只留最近 200 行（省内存）——文件里是全的，删的是屏上的旧行
             doc = self.log_box.document()
             if doc.blockCount() > 200:
                 cursor = self.log_box.textCursor()
@@ -413,11 +507,13 @@ class Main(QMainWindow):
                 cursor.removeSelectedText()
                 cursor.deleteChar()
         except RuntimeError:
-            pass
+            if line:
+                write_log_file(line)
 
     def clear_log(self):
-        """手动清除日志"""
+        """手动清除界面日志（文件里一个字不动）"""
         self.log_box.clear()
+        write_log_file("[清屏] 界面日志已清空，文件里全都还在")
 
     def _run_ui(self, fn):
         try:
@@ -443,6 +539,19 @@ class Main(QMainWindow):
             wid.setEnabled(name == "fps")
         self.refresh()
 
+    def _selected_genders(self):
+        """勾选框 → 类别元组。一个都不勾时返回空元组（调用处必须拦住，不能让它悄悄变成全拦）。"""
+        return tuple(k for k, cb in self.gender_checks.items() if cb.isChecked())
+
+    def _sync_range_settings(self):
+        """年龄/性别/换IP/验证等待写进 settings：FPS 引擎是直接从库里读这几个键的，
+        不点「保存配置」也得按面板走，否则屏上改了、抓起来还是老默认值（显示要等于实际）。"""
+        eng.set_setting("min_age", self.min_age_input.value())
+        eng.set_setting("max_age", self.max_age_input.value())
+        eng.set_setting("fps_rotations", self.max_rotations_input.value())
+        eng.set_setting("challenge_wait", self.challenge_wait_input.value())
+        eng.set_setting("keep_genders", ",".join(self._selected_genders()))
+
     def save_config(self):
         self._apply_core()
         eng.set_setting("proxy", self.proxy_input.text().strip())
@@ -455,6 +564,7 @@ class Main(QMainWindow):
         eng.set_setting("fps_max_pages", self.fps_pages_input.value())
         eng.set_setting("fps_headless", "0" if self.fps_window_check.isChecked() else "1")
         eng.set_setting("fps_hide_window", "1" if self.fps_hide_check.isChecked() else "0")
+        self._sync_range_settings()
         eng.set_setting("prevent_sleep", "1" if self.prevent_sleep_check.isChecked() else "0")
         eng.set_setting("sleep_timer_hours", self.sleep_timer_input.value())
         self.log("配置已保存")
@@ -527,6 +637,11 @@ class Main(QMainWindow):
         if solve_captcha and not capsolver:
             QMessageBox.warning(self, "配置不完整", "勾选了“解验证码”但未填写验证码 Key")
             return
+        if not self._selected_genders():
+            # 一性别都不勾 = 谁都进不了详情页，跑一小时 0 人还看不出原因，当场拦住
+            QMessageBox.warning(self, "配置不完整", "「保留性别」一个都没勾，这样一个人都不会被抓。\n"
+                                                 "至少勾「男」（要女性就再加「女」）。")
+            return
 
         eng.set_setting("proxy", proxy)
         eng.set_setting("proxy_pass", proxy_pass)
@@ -540,6 +655,7 @@ class Main(QMainWindow):
         eng.set_setting("fps_max_pages", self.fps_pages_input.value())
         eng.set_setting("fps_headless", "0" if self.fps_window_check.isChecked() else "1")
         eng.set_setting("fps_hide_window", "1" if self.fps_hide_check.isChecked() else "0")
+        self._sync_range_settings()
 
         self.running = True
         self.start_time = time.time()
@@ -575,7 +691,10 @@ class Main(QMainWindow):
                             future = executor.submit(
                                 eng.process_address, addr, proxy, proxy_pass, capsolver,
                                 worker_id=idx, progress_cb=on_progress,
-                                max_attempts=max_attempts, solve_captcha=solve_captcha)
+                                max_attempts=max_attempts, solve_captcha=solve_captcha,
+                                # 后面还排着别的地址才允许「弹回首页就放手」：车道不该
+                                # 在这条地址上等 6 次加载（实测中位 111.8 秒），先去做下一家
+                                allow_defer=(eng is eng_fps and bool(queue)))
                             futures[future] = addr
                             idx += 1
 
@@ -591,6 +710,13 @@ class Main(QMainWindow):
                             url = futures.pop(future)
                             try:
                                 success, data = future.result()
+                                if success and data.get("deferred"):
+                                    queue.append(url)
+                                    self.bridge.log.emit(
+                                        f"↻ {url[:34]}：{data.get('passes', 0)} 个出口弹回首页，"
+                                        f"退回队尾等复测（车道已腾出来）")
+                                    self.bridge.refresh.emit()
+                                    continue
                                 if success:
                                     self.bridge.log.emit(
                                         f"✓ {url[:34]}：入库{data['people']}人 / 出表{data['people']}条"
@@ -699,6 +825,11 @@ class Main(QMainWindow):
     def export_addrs(self, statuses, label):
         path, _ = QFileDialog.getSaveFileName(self, f"导出{label}地址", str(BASE), "Text (*.txt)")
         if not path:
+            return
+        if statuses is None:
+            out, count = eng.export_no_data(path)
+            self.log(f"导出{label}地址 {count} 条（判无住户+跑完0人+失败，不含没跑完的）→ {out}")
+            QMessageBox.information(self, "导出", f"{label} {count} 条地址")
             return
         out, count = eng.export_addresses(statuses, path)
         self.log(f"导出{label}地址 {count} 条 → {out}")

@@ -68,12 +68,12 @@ def connect():
 # 抓取线程这边排队等待 0 秒，写盘再慢也不挡个人页。
 # 断电最多丢最后没提交的那一批（秒级），丢的人在表里还是 pending，重跑会重新采到，
 # 语句本身带「只有真拿到号码才覆盖」，重采不会把已有号码抹掉。
-_PERSON_SQL = ("INSERT INTO results(address,name,age,location,phones,created_at,nphone,agenum)"
-               " VALUES(?,?,?,?,?,?,?,?)"
+_PERSON_SQL = ("INSERT INTO results(address,name,age,location,phones,emails,created_at,nphone,agenum)"
+               " VALUES(?,?,?,?,?,?,?,?,?)"
                " ON CONFLICT(address,name,age) DO UPDATE SET"
                " location=excluded.location, phones=excluded.phones,"
-               " created_at=excluded.created_at, nphone=excluded.nphone,"
-               " agenum=excluded.agenum WHERE excluded.phones<>''")
+               " emails=excluded.emails, created_at=excluded.created_at,"
+               " nphone=excluded.nphone, agenum=excluded.agenum WHERE excluded.phones<>''")
 WRITE_QUEUED = WRITE_OK = WRITE_BAD = 0
 _WRITE_ERR = ""
 _write_q = queue.Queue()
@@ -155,15 +155,18 @@ def start_writer():
 
 def write_person(args):
     """把一个人交给写线程，立刻返回（抓取路径不再等 SQLite）。
+    入参 (地址, 姓名, 年龄, 居住地, 号码串, 时间[, 邮箱串])：邮箱只有 FPS 给，TPS 留空。
     顺手把「号码几个」「年龄几岁」两个整数存进表里：界面统计直接对整数列求和，
     不用再每 3 秒把整张表读出来逐行数（40 万行实测：逐行 1459ms/次 vs 整数列 70ms/次）。
     两个整数就是用导出同一套 _age_cell / 同一种切段算法算的，统计和导出必然一模一样。"""
     global WRITE_QUEUED
     start_writer()
     row = list(args)
+    emails = ",".join(e for e in str(row[6] if len(row) > 6 else "").replace("|", ",").split(",")
+                      if e.strip())
     row[4] = ",".join(p for p in str(row[4] or "").replace("|", ",").split(",") if p.strip())
-    row += _tally(row[2], row[4])
-    _write_q.put(tuple(row))
+    n, a = _tally(row[2], row[4])
+    _write_q.put((row[0], row[1], row[2], row[3], row[4], emails, row[5], n, a))
     WRITE_QUEUED += 1
 
 
@@ -233,6 +236,12 @@ def init_db():
         have = [r[1] for r in con.execute("PRAGMA table_info(addresses)")]
         if "traffic_kb" not in have:
             con.execute("ALTER TABLE addresses ADD COLUMN traffic_kb INTEGER DEFAULT 0")
+        # 弹回首页的次数（每个出口 IP 一次）：够 fps_nodata_confirm 次才允许判「这地址没人」
+        if "empty_passes" not in have:
+            con.execute("ALTER TABLE addresses ADD COLUMN empty_passes INTEGER DEFAULT 0")
+        # 被拦后退回队尾的次数：一条地址不该把车道钉死（实测同一地址连吃 5 个出口 6 分钟 0 进展）
+        if "defer_passes" not in have:
+            con.execute("ALTER TABLE addresses ADD COLUMN defer_passes INTEGER DEFAULT 0")
         con.execute("""CREATE TABLE IF NOT EXISTS results(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             address TEXT,
@@ -242,8 +251,12 @@ def init_db():
             phones TEXT,
             created_at TEXT,
             nphone INTEGER,
-            agenum INTEGER
+            agenum INTEGER,
+            emails TEXT DEFAULT ''
         )""")
+        # 迁移：老库补 emails 列（个人页 email_section 里的邮箱，一人最多存 2 个）
+        if "emails" not in [r[1] for r in con.execute("PRAGMA table_info(results)")]:
+            con.execute("ALTER TABLE results ADD COLUMN emails TEXT DEFAULT ''")
         con.execute("CREATE INDEX IF NOT EXISTS idx_results_created ON results(created_at DESC)")
         con.execute("""DELETE FROM results WHERE id NOT IN
                        (SELECT MIN(id) FROM results GROUP BY address,name,age)""")
@@ -358,15 +371,16 @@ def export_csv(path=None):
     lines = 0
     with open(out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["姓名", "性别", "年龄", "居住地", "电话", "查询地址", "采集时间"])
+        w.writerow(["姓名", "性别", "年龄", "居住地", "电话", "查询地址", "采集时间", "邮箱"])
         for r in rows:
             if not _passes_age(r["age"], lo, hi):
                 continue
             age_text, _ = _age_cell(r["age"])
             phones = [p for p in str(r["phones"] or "").replace("|", ",").split(",") if p.strip()]
+            emails = [e for e in str(r["emails"] or "").replace("|", ",").split(",") if e.strip()]
             w.writerow([r["name"], gender_label.get(gender_bucket(r["name"]), "未知"),
                         age_text, r["location"], clean_phone(phones[0]) if phones else "",
-                        r["address"], r["created_at"]])
+                        r["address"], r["created_at"], ";".join(emails)])
             lines += 1
     return str(out), lines
 
@@ -379,6 +393,21 @@ def export_addresses(statuses, path=None):
             f"SELECT address FROM addresses WHERE status IN ({marks}) ORDER BY created_at",
             tuple(statuses)).fetchall()
     out = Path(path) if path else BASE / f"addresses_{'-'.join(statuses)}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
+    out.write_text("".join(r["address"] + "\n" for r in rows), encoding="utf-8")
+    return str(out), len(rows)
+
+
+# 「没数据」不等于状态 nodata：列表页整批被弹光时照样写 done，所以只认存到 0 人。
+# running/pending 不算——那是没跑完，不是没数据。
+NO_DATA_SQL = ("SELECT address FROM addresses WHERE COALESCE(people,0)=0 "
+               "AND status IN ('nodata','done','failed') ORDER BY status,created_at")
+
+
+def export_no_data(path=None):
+    """导出跑过但一个人都没落到的地址（判无住户 + 0 人收尾的 + 失败的）。"""
+    with connect() as con:
+        rows = con.execute(NO_DATA_SQL).fetchall()
+    out = Path(path) if path else BASE / f"addresses_no_data_{datetime.now().strftime('%Y%m%d_%H%M')}.txt"
     out.write_text("".join(r["address"] + "\n" for r in rows), encoding="utf-8")
     return str(out), len(rows)
 

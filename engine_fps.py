@@ -36,6 +36,7 @@ import_addresses = tps.import_addresses
 stats = tps.stats
 export_csv = tps.export_csv
 export_addresses = tps.export_addresses
+export_no_data = tps.export_no_data
 clean_phone = tps.clean_phone
 get_setting = tps.get_setting
 set_setting = tps.set_setting
@@ -44,6 +45,8 @@ start_relay = tps.start_relay
 
 FPS_HOST = "https://www.fastpeoplesearch.com"
 LISTING_PAGE_SIZE = 10
+# 个人页 email_section 常给 3~5 个，用户定的口径是每人只留最前 2 个
+MAX_EMAILS = 2
 
 # 验证页标记：标题 + 正文双查（实测有一种 100KB 页标题不带任何词）
 CF_TITLE_MARKERS = ("security challenge", "attention required", "just a moment",
@@ -58,6 +61,9 @@ NETERR_MARKERS = ("err_connection_closed", "err_connection_reset", "err_connecti
                   "err_network_changed", "err_empty_response", "err_name_not_resolved",
                   "err_proxy_connection_failed", "err_tunnel_connection_failed",
                   "err_too_many_redirects")
+# 白页（一个字都没收到）最多等多久。11-17 实测本轮 189 次白页：中位 4 秒开始流、
+# 最长 87 秒；120 秒一刀切在本批一次都没砍掉过真到位的页，却能把吞请求的死出口提前放掉。
+BLANK_WAIT_S = 120
 
 # 限流页/拉黑页签名（Temp\sourcescan\rate_hit 与 rate_hit2 归档的 31 份原件实扫定案）：
 # 这类页一个都不带 _cf_chl_opt，而真挑战页 11/11 都带 —— 所以它们不是「等一等就自过」的页面，
@@ -70,6 +76,13 @@ RATE_BODY_MARKERS = ("rate limit exceeded", "you have exceeded the amount of req
 # CF 硬拒页：标题是 attention required 但正文写的是「你已经被拒」，不是「正在验证」
 HARD_BLOCK_MARKERS = ("sorry, you have been blocked", "you've been blocked",
                       "you are unable to access")
+# 站点自己的「Are you human?」reCAPTCHA 确认页（11-17 他截图：正文
+# "We've noticed some strange activity from your ip address ... fill out the re-captcha and then hit submit"）。
+# 它不带 _cf_chl_opt，所以不是 Cloudflare 那种等 90~165 秒会自过的题；必须真解题才能过，
+# 而 FPS 全程没接打码（solve_captcha 参数收了不用）。正文自己写了「是你这条 IP 有异常」
+# ⇒ 能做的正确反应是换新出口重试，而不是同一条 IP 白等满 200 秒 × 重载 × 12 副浏览器。
+HUMAN_CHECK_MARKERS = ("are you human", "please fill out the re-captcha",
+                       "confirm that you are not a bot")
 
 # 实测定案：只拦图片+媒体（按扩展名），字体/样式放行；全拦会把挑战摊薄弄坏
 BLOCK_URL_PATTERNS = ["*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.svg", "*.ico",
@@ -136,6 +149,21 @@ def _title_of(content):
     return re.sub(r"\s+", " ", m.group(1)).strip().lower() if m else ""
 
 
+def _is_blank(text):
+    """一个字都没收到（或只有 Chrome 的空壳）。
+    实测坑（11-17 他截图 304 Hillcrest Dr 整屏全白）：这种页以前被 _is_challenge 里
+    「没标题就算验证页」那一行认成 challenge，日志写成验证页，还白等满 201 秒。
+    本轮 189 次白页实测：中位 4 秒就有内容进来，最长 87 秒；所以它既不是验证页，
+    也不该跟验证页共用 200 秒预算。
+    只认「没标题 + 没任何页面标记 + 不足 200 字节」：有标题或撞出验证/限流字样的
+    一律放行给后面的判定，免得把半截的真验证页误当成白页提前换出口。"""
+    t = (text or "").strip()
+    if len(t) >= 200 or _title_of(t):
+        return False
+    low = t.lower()
+    return not any(k in low for k in CF_BODY_MARKERS + RATE_BODY_MARKERS + HARD_BLOCK_MARKERS)
+
+
 def _is_challenge(content):
     text = content or ""
     title = _title_of(text)
@@ -157,12 +185,15 @@ def _hard_page_state(text):
         return "ratelimited"
     if any(k in low for k in HARD_BLOCK_MARKERS):
         return "hardblock"
+    if any(k in low for k in HUMAN_CHECK_MARKERS):
+        return "humancheck"
     return ""
 
 
 def page_state(content, kind="listing"):
-    """challenge=验证页 / ratelimited=这 IP 被限流 / hardblock=这 IP 被拉黑 /
-    bounced=被弹回首页 / neterror=出口断连报错页 / loading=标题对了但内容还在流 / ready=内容到位"""
+    """blank=一个字都没收到 / challenge=验证页 / ratelimited=这 IP 被限流 /
+    hardblock=这 IP 被拉黑 / bounced=被弹回首页 / neterror=出口断连报错页 /
+    loading=标题对了但内容还在流 / ready=内容到位"""
     text = content or ""
     low = text.lower()
     if any(k in low for k in NETERR_MARKERS):
@@ -170,6 +201,8 @@ def page_state(content, kind="listing"):
     hard = _hard_page_state(text)
     if hard:
         return hard
+    if _is_blank(text):
+        return "blank"
     if _is_challenge(text):
         return "challenge"
     if _title_of(text) == HOME_TITLE:
@@ -177,7 +210,12 @@ def page_state(content, kind="listing"):
     if kind == "person":
         ok = 'id="full_name_section"' in text or 'id="phone_number_section"' in text
     else:
-        ok = '"card" id=' in text
+        # 实测坑（11-17 他截图：14312 Hiseville Ct, Frisco TX 新房 2025 年建）：页面是**真到位**的
+        # 地址页，有 Property Details、有面包屑，但一个住户都没有 ⇒ 一张 "card" id= 都找不到。
+        # 旧判定只认卡片，于是这页被当 loading 白等满 200 秒 × 重载 3 次 × 最多 12 副浏览器。
+        # 居民容器 id="residents" 在真地址页上一定存在（有人的页面里它就在卡片上方），
+        # 所以容器到位 = 页面到位，有没有人交给 parse_listing 去数。
+        ok = '"card" id=' in text or 'id="residents"' in text
     return "ready" if ok else "loading"
 
 
@@ -262,8 +300,14 @@ def parse_person(content, url=""):
                   _section(content, 'id="current_address_section"'), re.S)
     if m:
         current = _txt(m.group(1))
+
+    emails = []
+    for m in re.finditer(r'>([^<>]*@[^<>]*)<', _section(content, 'id="email_section"')):
+        e = _txt(m.group(1)).strip()
+        if "@" in e and e not in emails:
+            emails.append(e)
     return {"name": name, "age": age, "location": current,
-            "phones": ",".join(phones)}
+            "phones": ",".join(phones), "emails": ",".join(emails[:MAX_EMAILS])}
 
 
 def next_listing_url(content, current_url):
@@ -321,23 +365,44 @@ async def _fetch(tab, relay, url, kind, log, timeout_s, rotations, sid_base):
                 if state == "neterror":
                     code = next((k.upper() for k in NETERR_MARKERS
                                  if k in (content or "").lower()), "NETERR")
-                    last_err = f"出口断连 {code}"
+                    # 11-15 定案就是「neterror 秒换 IP」：出口死口时同一条出口重载还是死口，
+                    # 白烧几次加载（实测那条 36MB 的教训）。直接抛，让外层整副浏览器重开换新出口。
                     log(f"页面报 {code}（出口死口，不是这地址没人）"
-                        f"，不等了直接重载重试（{relay.bytes_transferred // 1024}KB）")
-                    break
-                if state in ("ratelimited", "hardblock"):
+                        f"⇒ 不等不重载，立刻重开浏览器换出口"
+                        f"（{relay.bytes_transferred // 1024}KB）")
+                    raise FpsNeedNewIp(f"出口断连 {code}（{len(content or '')} 字节，"
+                                       f"{relay.bytes_transferred // 1024}KB）")
+                if state in ("ratelimited", "hardblock", "humancheck"):
                     # 立刻再看一眼确认（只有可能是半加载撞字样时才会翻案），是硬页就绝不等：
-                    # 这两类页不带 _cf_chl_opt，不是会自过的挑战，等到天黑也原样返回。
+                    # 这几类页不带 _cf_chl_opt，不是会自过的挑战，等到天黑也原样返回。
                     again = await _content(tab)
                     state2 = page_state(again, kind)
                     if state2 == state:
+                        why = {"ratelimited": "出口 IP 被限流", "hardblock": "出口 IP 被拉黑",
+                               "humancheck": "站点自己的 reCAPTCHA 确认页"
+                                             "（正文写「是你这条 IP 有异常」，不解题过不去）"}[state]
                         raise FpsNeedNewIp(
-                            f"出口 IP 被{'限流' if state == 'ratelimited' else '拉黑'}"
-                            f"（标题『{_title_of(content)[:26]}』 {len(content or '')} 字节，"
+                            f"{why}（标题『{_title_of(content)[:26]}』 {len(content or '')} 字节，"
                             f"{relay.bytes_transferred // 1024}KB）")
                     content, state = again, state2
                     if state == "ready":
                         return content
+                if state == "blank":
+                    # 全白页：请求发出去了但一个字节都没回来。以前落到 _is_challenge 的
+                    # 「没标题=验证页」那一行，于是日志写 challenge、白等满 201 秒（他截图的
+                    # 「进不去」就是这种）。先等它开始流（实测中位 4 秒），但只给 BLANK_WAIT_S，
+                    # 过点还是全白 = 这条出口把请求吞了，直接重开浏览器换新出口。
+                    if time.time() - t0 >= BLANK_WAIT_S:
+                        secs = int(time.time() - t0)
+                        log(f"白页 {secs} 秒一个字都没收到（{relay.bytes_transferred // 1024}KB）"
+                            f"⇒ 不等验证页那 200 秒，重开浏览器换出口")
+                        raise FpsNeedNewIp(f"白页 {secs} 秒零字节（{relay.bytes_transferred // 1024}KB）")
+                    if last_state != state:
+                        log(f"全白页，一个字都没收到（已等 {int(time.time() - t0)}s，"
+                            f"{relay.bytes_transferred // 1024}KB）")
+                        last_state = state
+                    await asyncio.sleep(2)
+                    continue
                 if state != last_state:
                     log(f"这页内容还没到位（{state} {len(content or '')} 字节，"
                         f"标题『{_title_of(content)[:40]}』）")
@@ -623,7 +688,9 @@ async def _run_attempt(address, url, relay, opt):
     browser = tab = None
     c = {"saved": 0, "phones": 0, "cards": 0, "skipped_age": 0, "skipped_gender": 0,
          "dup": 0, "no_phone": 0, "pages": 0}
-    targets, seen, pending = [], set(), []
+    targets = opt.setdefault("queue", [])
+    seen = opt.setdefault("seen", set())
+    pending = []
     kind = "done"
     err = ""
     try:
@@ -632,56 +699,73 @@ async def _run_attempt(address, url, relay, opt):
         # ===== 列表页（含翻页）=====
         listing_url = url
         cap = int(opt["max_persons"])
-        try:
-            for _ in range(max(1, opt["max_pages"])):
-                content = await _fetch(tab, relay, listing_url, "listing", _log,
-                                       opt["challenge_wait"], opt["rotations"], opt["sid"])
-                c["pages"] += 1
-                if content == "":
-                    # 换过 IP 还是被弹回首页：这才允许判这个地址没人
-                    _log(f"空(FPS): 同一条出口重载 {opt['rotations'] + 1} 次都被弹回首页"
-                         f"（卡片{c['cards']}张，流量{relay.bytes_transferred // 1024}KB）")
-                    return "nodata", c, [], "换IP复测仍弹回首页"
-                found = parse_listing(content, listing_url)
-                if not found:
-                    break
-                for person in found:
-                    c["cards"] += 1
-                    try:
-                        a = int(str(person["age"] or "").strip())
-                    except ValueError:
-                        a = None
-                    if a is not None and not (opt["min_age"] <= a <= opt["max_age"]):
-                        c["skipped_age"] += 1
-                        continue
-                    if person["link"] in seen:
-                        c["dup"] += 1
-                        continue
-                    seen.add(person["link"])
-                    targets.append(person)
-                    if cap and len(targets) >= cap:
+        done = opt.setdefault("done", set())
+        if targets:
+            # 上一轮已经把这地址的人列出来了，就绝不重读列表页：实测同一个地址（36 卡片/28 人）
+            # 连开 10 副浏览器，每副都先花 22~95 秒把列表重读一遍，累计 451 秒 = 这条车道 76%
+            # 的时间，而卡在后头等的那 24 个人一个没动。人名册跨轮是稳的，直接续做。
+            left = len([p for p in targets if p["link"] not in done])
+            _log(f"列表不重读：名册已有 {len(targets)} 人，其中 {left} 人没做完，"
+                 f"直接从没做完的那个接着抓")
+        else:
+            try:
+                for _ in range(max(1, opt["max_pages"])):
+                    content = await _fetch(tab, relay, listing_url, "listing", _log,
+                                           opt["challenge_wait"], opt["rotations"], opt["sid"])
+                    c["pages"] += 1
+                    if content == "":
+                        # 换过 IP 还是被弹回首页：这才允许判这个地址没人
+                        _log(f"空(FPS): 同一条出口重载 {opt['rotations'] + 1} 次都被弹回首页"
+                             f"（卡片{c['cards']}张，流量{relay.bytes_transferred // 1024}KB）")
+                        return "nodata", c, [], "换IP复测仍弹回首页"
+                    found = parse_listing(content, listing_url)
+                    if not found and 'id="residents"' in content:
+                        # 只多读一次、多等 2 秒：防半截页（容器到了卡片还没到）被误判成「没住户」
+                        await asyncio.sleep(2)
+                        again = await _content(tab)
+                        found2 = parse_listing(again, listing_url)
+                        if found2:
+                            content, found = again, found2
+                    if not found:
+                        _log(f"没住户(FPS)：地址页已到位（{len(content) // 1024}KB、居民容器在），"
+                             f"但居民卡 0 张 ⇒ 不重载不重开，这条判完立刻换下一条")
                         break
-                if len(found) < LISTING_PAGE_SIZE or (cap and len(targets) >= cap):
-                    break
-                nxt = next_listing_url(content, listing_url)
-                if not nxt:
-                    break
-                listing_url = nxt
-        except FpsNeedNewIp as exc:
-            kind, err = "blocked", str(exc)
-            _log(f"{exc} ⇒ 就地换 IP 换不动（隧道复用），整副浏览器重开换新出口")
-        except FpsBlocked as exc:
-            kind, err = "blocked", str(exc)
+                    for person in found:
+                        c["cards"] += 1
+                        try:
+                            a = int(str(person["age"] or "").strip())
+                        except ValueError:
+                            a = None
+                        if a is not None and not (opt["min_age"] <= a <= opt["max_age"]):
+                            c["skipped_age"] += 1
+                            continue
+                        if person["link"] in seen:
+                            c["dup"] += 1
+                            continue
+                        seen.add(person["link"])
+                        targets.append(person)
+                        if cap and len(targets) >= cap:
+                            break
+                    if len(found) < LISTING_PAGE_SIZE or (cap and len(targets) >= cap):
+                        break
+                    nxt = next_listing_url(content, listing_url)
+                    if not nxt:
+                        break
+                    listing_url = nxt
+            except FpsNeedNewIp as exc:
+                kind, err = "blocked", str(exc)
+                _log(f"{exc} ⇒ 就地换 IP 换不动（隧道复用），整副浏览器重开换新出口")
+            except FpsBlocked as exc:
+                kind, err = "blocked", str(exc)
 
-        _log(f"列表：卡片{c['cards']}张 → 待做{len(targets)}人"
-             f"（年龄不符{c['skipped_age']} 重复{c['dup']}）"
-             f" 流量:{relay.bytes_transferred // 1024}KB")
+            _log(f"列表：卡片{c['cards']}张 → 待做{len(targets)}人"
+                 f"（年龄不符{c['skipped_age']} 重复{c['dup']}）"
+                 f" 流量:{relay.bytes_transferred // 1024}KB")
         if kind != "done":
             return kind, c, list(targets), err
 
         # ===== 个人页取电话 =====
         pending = list(targets)
-        done = opt.setdefault("done", set())
         while pending and kind == "done":
             person = pending[0]
             if person["link"] in done:
@@ -734,12 +818,13 @@ async def _run_attempt(address, url, relay, opt):
             # 抓取线程只把人交给专职写线程（实测每人开一次连接抢写锁，最差能拖到 4.3 秒）
             # 入库就用这个剔过空段的同一个列表拼的串：界面「号码N个」必须等于库里的段数
             tps.write_person((address, rec["name"], rec["age"], rec["location"],
-                              ",".join(phones), now))
+                              ",".join(phones), now, rec["emails"]))
             c["saved"] += 1
             c["phones"] += len(phones)
             if not phones:
                 c["no_phone"] += 1
             _log(f"  {rec['name']} {rec['age']}岁 号码{len(phones)}个（出表只写第一个）"
+                 f" 邮箱{len([e for e in rec['emails'].split(',') if e])}个"
                  f" 累计{c['saved']}人/全部号{c['phones']} 流量:{relay.bytes_transferred // 1024}KB")
         return kind, c, pending, err
     except Exception as exc:
@@ -748,12 +833,27 @@ async def _run_attempt(address, url, relay, opt):
         await _close_browser(browser, _log)
 
 
+_UNSET = object()   # 「调用方没填」的哨兵：区别于显式传 None（None = 不筛性别）
+
+
+def resolve_keep_genders(keep_genders=_UNSET):
+    """界面没显式传性别时，按 settings 里存的「保留性别」走（面板改完不用重启线程）。
+    存成空串 ⇒ 当成 None（不筛性别）：绝不能把「一格没勾」执行成「谁都不要」把整批人拦光。"""
+    if keep_genders is not _UNSET:
+        return keep_genders
+    raw = str(get_setting("keep_genders", "male,andy,unknown")).strip()
+    return tuple(x.strip() for x in raw.split(",") if x.strip()) or None
+
+
 def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_id=0,
                     max_pages=None, progress_cb=None, max_attempts=12, solve_captcha=True,
-                    max_persons=None, keep_genders=("male", "andy", "unknown")):
+                    max_persons=None, keep_genders=_UNSET,
+                    allow_defer=False):
     """查询一个地址：列表页（含翻页）→ 逐个个人页取电话。
     年龄口径沿用 settings 的 min_age/max_age（默认 50-85），性别默认剔女（keep_genders=None 则不筛）。
     max_pages/max_persons 留空走设置里的 fps_max_pages / fps_max_persons（人数 0 = 不封顶）。
+    allow_defer：调度队列后面还有别的地址时才给 True。True 时「弹回首页」不在车道上干等
+    ——一次加载就放手，把这条地址退回队尾，等别的地址跑完再换出口回来复测。
     返回 (True, 统计) / (False, 统计)，与 TPS 核心同形状，界面代码不用改。
     """
     def _log(msg):
@@ -782,15 +882,31 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
         max_pages = int(get_setting("fps_max_pages", 10))
     if max_persons is None:
         max_persons = int(get_setting("fps_max_persons", 0))
+    if keep_genders is _UNSET:
+        keep_genders = resolve_keep_genders()
     # 弹回首页 ≠ 没人：线路被限流时好地址也整批弹首页（11-15 实测：两小时前抓到 26 人的
-    # 地址，刚连吃 3 个出口 IP 全弹首页）。判「无人」必须换整副浏览器+IP 复测够轮数才算。
+    # 地址，刚连吃 3 个出口 IP 全弹首页）。判「无人」必须看过够多个出口 IP 才算。
     confirm_nodata = max(1, int(get_setting("fps_nodata_confirm", 2)))
-    nodata_rounds = 0
+    rotations = int(get_setting("fps_rotations", 2))
+    if allow_defer:
+        # 退回队尾的走法：一条出口只加载 1 次就放手，次数改按「看过几个出口 IP」算。
+        # 就地死等那条路（allow_defer=False）保持原样，每出口仍重载 rotations+1 次。
+        # 判死要看过 3 个不同出口（比原来 2 个多一个）：每次只剩 1 次加载，证据靠出口数补。
+        rotations = 0
+        confirm_nodata = max(3, confirm_nodata)
+    with connect() as con:
+        row = con.execute("SELECT empty_passes, defer_passes FROM addresses WHERE address=?",
+                          (address,)).fetchone()
+    nodata_rounds = int(row["empty_passes"]) if row and row["empty_passes"] else 0
+    defer_passes = int(row["defer_passes"]) if row and row["defer_passes"] else 0
+    # 一条地址最多退回队尾几次，之后按失败收尾（不然全是死地址时会无限打转）
+    defer_cap = max(1, int(get_setting("fps_defer_cap", 4)))
+    stuck = 0
 
     opt = {"log": _log, "now": now, "min_age": int(get_setting("min_age", tps.MIN_AGE)),
            "max_age": int(get_setting("max_age", tps.MAX_AGE)),
            "challenge_wait": int(get_setting("challenge_wait", 200)),
-           "rotations": int(get_setting("fps_rotations", 2)),
+           "rotations": rotations,
            "headless": get_setting("fps_headless", "0") == "1",
            "hide": get_setting("fps_hide_window", "0") == "1",
            "max_pages": max(1, int(max_pages)),
@@ -827,15 +943,34 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
 
         if kind == "nodata":
             nodata_rounds += 1
+            if allow_defer and nodata_rounds < confirm_nodata:
+                # 不在车道上等：状态退回 pending、记上看过的出口数，调度器把这条挪到队尾。
+                # 车道立刻去跑下一个地址，等队列转回来再换一副浏览器+新出口复测。
+                with connect() as con:
+                    con.execute("UPDATE addresses SET status='pending',empty_passes=?,"
+                                "traffic_kb=?,error=?,updated_at=? WHERE address=?",
+                                (nodata_rounds, traffic_kb,
+                                 f"弹回首页 {nodata_rounds}/{confirm_nodata} 个出口，已退回队尾待复测",
+                                 now, address))
+                _log(f"秒放手(FPS)：这条出口 1 次加载就弹回首页、0 卡片 ⇒ 不占车道，"
+                     f"退回队尾，{nodata_rounds}/{confirm_nodata} 个出口看过后再判")
+                return True, {"records": 0, "people": 0, "phones": 0, "list": 0,
+                              "title": "fastpeoplesearch", "traffic_kb": traffic_kb,
+                              "skipped_blocked": 0, "skipped_gender": totals["skipped_gender"],
+                              "skipped_low": totals["skipped_age"], "skipped_high": 0,
+                              "dup_skipped": totals["dup"], "no_phone": totals["no_phone"],
+                              "dead_skipped": 0, "cards_seen": totals["cards"],
+                              "abandoned": 0, "nodata": False, "deferred": True,
+                              "passes": nodata_rounds}
             if nodata_rounds < confirm_nodata:
                 _log(f"这轮同一条出口重载 {opt['rotations'] + 1} 次都被弹回首页——先不判「没人」，"
                      f"换新浏览器+新出口 IP 再复测（第 {nodata_rounds}/{confirm_nodata} 轮）")
                 continue
-            why = (f"换浏览器复测 {nodata_rounds} 轮（{nodata_rounds} 个出口 IP，"
-                   f"每出口重载 {opt['rotations'] + 1} 次）仍弹回首页")
+            why = (f"看过 {nodata_rounds} 个出口 IP"
+                   f"（每出口重载 {opt['rotations'] + 1} 次）仍弹回首页")
             with connect() as con:
                 con.execute("UPDATE addresses SET status='nodata',records=0,people=0,"
-                            "phones=0,traffic_kb=?,error=?,updated_at=?"
+                            "phones=0,traffic_kb=?,error=?,empty_passes=0,updated_at=?"
                             " WHERE address=?", (traffic_kb, why, now, address))
             return True, {"records": 0, "people": 0, "phones": 0, "list": 0,
                           "title": "fastpeoplesearch", "traffic_kb": traffic_kb,
@@ -848,6 +983,30 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
         people_total = max(people_total, totals["saved"] + len(pending))
 
         if kind in ("blocked", "error"):
+            stuck = stuck + 1 if not c.get("saved") else 0
+            if allow_defer and stuck >= 2 and pending and defer_passes < defer_cap:
+                # 一条地址不该把整条车道钉死：实测同一地址连吃 5 个出口、6 分钟 0 进展，
+                # 而这 6 分钟里别的地址本可以让这条车道跑。人册留在内存队列里没用，
+                # 退回 pending + 记次数，调度器把它挪到队尾，等这轮转完再回来续做。
+                defer_passes += 1
+                with connect() as con:
+                    con.execute("UPDATE addresses SET status='pending',defer_passes=?,"
+                                "traffic_kb=?,error=?,updated_at=? WHERE address=?",
+                                (defer_passes, traffic_kb,
+                                 f"连续被拦 {stuck} 轮，剩 {len(pending)} 人，已退回队尾"
+                                 f"（第 {defer_passes}/{defer_cap} 次）", now, address))
+                _log(f"秒放手(FPS)：{last_error or '被拦'}，剩 {len(pending)} 人 —— 不钉在这条地址，"
+                     f"退回队尾，第 {defer_passes}/{defer_cap} 次")
+                return True, {"records": 0, "people": 0, "phones": 0,
+                              "list": people_total, "title": "fastpeoplesearch",
+                              "traffic_kb": traffic_kb, "skipped_blocked": 0,
+                              "skipped_gender": totals["skipped_gender"],
+                              "skipped_low": totals["skipped_age"], "skipped_high": 0,
+                              "dup_skipped": totals["dup"], "no_phone": totals["no_phone"],
+                              "dead_skipped": 0, "cards_seen": totals["cards"],
+                              "abandoned": len(pending), "nodata": False,
+                              "deferred": True, "defer_reason": "被拦",
+                              "passes": defer_passes, "remaining": len(pending)}
             _log(f"被拦/换 IP：{last_error or '验证压不住'}，剩余 {len(pending)} 人下一轮接着做")
             if not last_error:
                 last_error = "FPS 验证页压不住"
@@ -855,7 +1014,8 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
 
         with connect() as con:
             con.execute("UPDATE addresses SET status='done',records=?,people=?,phones=?,"
-                        "traffic_kb=?,error='',updated_at=? WHERE address=?",
+                        "traffic_kb=?,error='',empty_passes=0,defer_passes=0,updated_at=?"
+                        " WHERE address=?",
                         (people_total, totals["saved"], totals["phones"], traffic_kb, now, address))
         _log(f"✓ 完成(FPS): 卡片{totals['cards']}张 → 存{totals['saved']}人"
              f"（有号{totals['saved'] - totals['no_phone']}/无号{totals['no_phone']}）"
@@ -870,8 +1030,10 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                       "dead_skipped": 0, "cards_seen": totals["cards"],
                       "abandoned": len(pending)}
 
-    _log(f"✗ {max_attempts}次全部失败: {last_error}")
+    _log(f"✗ {max_attempts}次全部失败: {last_error}"
+         + (f"（退回队尾 {defer_passes}/{defer_cap} 次后仍被拦）" if defer_passes else ""))
     with connect() as con:
-        con.execute("UPDATE addresses SET status='failed',error=?,updated_at=? WHERE address=?",
+        con.execute("UPDATE addresses SET status='failed',error=?,defer_passes=0,"
+                    "empty_passes=0,updated_at=? WHERE address=?",
                     (last_error[:300], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), address))
     return False, {"error": last_error, "title": "fastpeoplesearch"}
