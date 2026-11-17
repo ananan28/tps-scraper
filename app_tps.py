@@ -48,16 +48,44 @@ BASE = Path(__file__).resolve().parent
 _LOG_DIR = eng_tps.BASE / "logs"
 _log_file = [None]
 _log_fh = [None]
+LOG_KEEP_DEFAULT = 60        # 默认保留最近 60 份运行日志（一次启动一份，天天跑也够存两个月）
+
+
+def prune_logs(keep, current):
+    """只删「最旧的已完成日志」，当前正在写的这份永远不碰；keep=0 ⇒ 一个都不删。
+    删除只在新日志文件建好之后发生，而且删掉几份会写进当前日志留痕，不搞静默清理。"""
+    if keep <= 0:
+        return []
+    files = sorted(p for p in _LOG_DIR.glob("运行_*.txt") if p.is_file())
+    gone = []
+    if len(files) > keep:
+        for p in files[:len(files) - keep]:
+            if p == current:
+                continue
+            try:
+                p.unlink()
+                gone.append(p.name)
+            except OSError:
+                pass        # 被资源管理器/杀软咬住就跳过，别把程序带崩
+    return gone
 
 
 def log_path():
-    """本次运行的日志文件路径（第一次写时才创建）。"""
+    """本次运行的日志文件路径（第一次写时才创建），同时按设置收掉最旧的那些。"""
     if _log_file[0] is None:
         _LOG_DIR.mkdir(exist_ok=True)
         name = f"运行_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         _log_file[0] = _LOG_DIR / name
         # 按行缓冲：程序被强杀也基本不丢；10 车道一起刷的时候不至于每条都开一次文件
         _log_fh[0] = open(_log_file[0], "a", encoding="utf-8", buffering=1)
+        try:
+            keep = int(eng_tps.get_setting("log_keep", LOG_KEEP_DEFAULT))
+        except (TypeError, ValueError):
+            keep = LOG_KEEP_DEFAULT
+        gone = prune_logs(keep, _log_file[0])
+        if gone:
+            _log_fh[0].write(f"[清理] 旧日志超出保留数 {keep}，已删最旧 {len(gone)} 份："
+                             f"{gone[0]} … {gone[-1]}（当前这份和最近 {keep} 份都没动）\n")
     return _log_file[0]
 
 
@@ -138,7 +166,13 @@ class Main(QMainWindow):
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self.refresh)
         self._stats_timer.start(3000)
-        self.log(f"就绪｜日志边写边存：{log_path()}（界面只显 200 行，文件里全程都在，程序自己从不删）")
+        p = log_path()      # 这句必须先跑：新文件建好 + 按保留份数收掉最旧的，都在这一步
+        try:
+            keep = int(eng_tps.get_setting("log_keep", LOG_KEEP_DEFAULT))
+        except (TypeError, ValueError):
+            keep = LOG_KEEP_DEFAULT
+        self.log(f"就绪｜日志边写边存：{p}（界面只显 200 行，文件里全程都在；"
+                 f"{f'保留最近 {keep} 份，启动时只删最旧的，当前这份永不动' if keep > 0 else '填了 0：一份都不删，磁盘自己盯'}）")
 
     def build(self):
         central = QWidget()
@@ -329,6 +363,18 @@ class Main(QMainWindow):
         self.sleep_timer_input.valueChanged.connect(self.save_config)
         self.sleep_timer_input.setToolTip("定时（小时）：0 = 不定时，一直唤醒到手动关")
         sleep_row.addWidget(self.sleep_timer_input)
+        # 日志保留份数：一次启动一个文件，只增不删会把磁盘堆满，所以给个上限。
+        # 默认 60 份，且永远不碰当前正在写的这份；填 0 = 一个都不删（想永久留就填 0）。
+        sleep_row.addWidget(QLabel("日志保留:"))
+        self.log_keep_input = QSpinBox()
+        self.log_keep_input.setRange(0, 9999)
+        self.log_keep_input.setValue(int(eng.get_setting("log_keep", LOG_KEEP_DEFAULT)))
+        self.log_keep_input.setSuffix(" 份")
+        self.log_keep_input.setToolTip(
+            "logs\\ 里最多留最近几份运行日志（一次启动一份）。默认 60 份，够天天跑两个月。\n"
+            "超出时只删最旧的，当前正在写的这份永远不动；删了几份会在日志里写一行留痕。\n"
+            "填 0 = 永不删除，全部留着（磁盘自己盯）。")
+        sleep_row.addWidget(self.log_keep_input)
         save_btn = QPushButton("保存配置")
         save_btn.clicked.connect(self.save_config)
         sleep_row.addWidget(save_btn)
@@ -567,6 +613,7 @@ class Main(QMainWindow):
         self._sync_range_settings()
         eng.set_setting("prevent_sleep", "1" if self.prevent_sleep_check.isChecked() else "0")
         eng.set_setting("sleep_timer_hours", self.sleep_timer_input.value())
+        eng.set_setting("log_keep", self.log_keep_input.value())
         self.log("配置已保存")
         if self.sender() and isinstance(self.sender(), QPushButton):
             QMessageBox.information(self, "保存", "配置已保存")
