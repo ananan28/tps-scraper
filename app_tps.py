@@ -2,9 +2,14 @@
 """TPS 抓取器 - 主界面"""
 import sys
 import os
+import re
 import time
+import json
+import queue
+import socket
 import threading
 from pathlib import Path
+from collections import Counter
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
@@ -25,6 +30,7 @@ from PySide6.QtWidgets import (
 
 import engine_tps182 as eng_tps      # 核心一：TruePeopleSearch（1.8.2 逐字节逻辑，被拦要解码）
 import engine_fps as eng_fps         # 核心二：FastPeopleSearch（个人页电话直出，解码费 0）
+import hub_client                    # 中心/远程：默认关着，关了 0 请求（随时监控那些电脑用的就是它）
 
 eng = eng_tps                         # 面板「查询核心」决定它指向哪个引擎
 
@@ -117,6 +123,63 @@ def format_traffic(kb):
     return f"{kb} KB"
 
 
+_EGRESS_RE = re.compile(r"出口\s+(?P<ip>\d{1,3}(?:\.\d{1,3}){3})｜(?P<loc>[^｜]{2,60})")
+_EGRESS_DEAD = re.compile(r"出口 IP 没读到")
+_LANE_RE = re.compile(r"\[W(?P<lane>\d+)\]")
+
+
+def lane_egress_seen(line, into):
+    """从「已经在写的那行出口日志」里顺手记下这条车道现在落在哪个国家，
+    中心面板上「出口国家分布」那一行就是这张表 —— 不另外发一个请求、不开一个标签页。
+    读不出来的（死口那行）记成「没读到」，别让它悄悄消失在看板里。"""
+    m = _EGRESS_RE.search(line)
+    w = _LANE_RE.search(line)
+    key = f"W{w.group('lane')}" if w else "本机"
+    if m:
+        loc = m.group("loc").strip()
+        into[key] = loc.split()[0] if loc else "没读到"
+        return
+    if _EGRESS_DEAD.search(line):
+        into[key] = "没读到"
+
+
+def free_mem_mb():
+    """这台电脑还剩多少物理内存（MB）。中心面板上「内存」那一格 = 这个数，
+    并发敢不敢再往上加就看它（11-17 实测每副浏览器 1.2~1.7GB，可用低于 ~4GB 就别再加车道）。
+    用 ctypes 的 GlobalMemoryStatusEx —— 不引 psutil：历史上一轮 psutil 轮询把界面卡住过。"""
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        class _MSX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.wintypes.DWORD),
+                        ("dwMemoryLoad", ctypes.wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+        m = _MSX()
+        m.dwLength = ctypes.sizeof(_MSX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return round(m.ullAvailPhys / 2 ** 20, 1)
+    except Exception:
+        pass
+    return 0.0
+
+
+def lan_ip():
+    """这台电脑在局域网里的 IP（中心面板上好认是哪台）；没网就 127.0.0.1。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 def mount(group, inner_layout):
     """把一段内容装进「可折叠」框里，并让那个勾选框真的能折叠。
 
@@ -161,7 +224,20 @@ class Main(QMainWindow):
         self.workers = []
         self.start_time = None
         self._concurrency = int(eng.get_setting("concurrency", 5))
+        self._inflight = 0          # 真在跑的车道数（调度线程写、心跳线程读，int 赋值就够原子）
+        self._my_ip = lan_ip()      # 这台机器在局域网里的地址，中心面板上好认
         self.build()
+        # ===== 中心/远程（默认全关：不勾就跟这台机器上没这功能一样，0 请求）=====
+        # 他说「我只是想随时监控这些电脑」⇒ 心跳+日志是主体，交号码、听控制各是单独一个勾。
+        self._lane_egress = {}
+        self._last_log = ""
+        self._cmd_q = queue.Queue()
+        self.hub = hub_client.Hub(eng_tps.get_setting, eng_tps.set_setting,
+                                  self._hub_note, self.hub_status, self.hub_cmd)
+        self._hub_timer = QTimer(self)      # 中心来的指令只能在主线程动界面，靠这个定时器排干
+        self._hub_timer.timeout.connect(self._drain_cmds)
+        self._hub_timer.start(1000)
+        self.hub.start()                    # 关着时那条线程只是看一眼勾，一个包都不发
         self.refresh()
         # 每 3 秒自动刷新统计（流量/完成数/速度等），运行时可见
         self._stats_timer = QTimer(self)
@@ -480,6 +556,80 @@ class Main(QMainWindow):
         mount(control, control_layout)
         left_layout.addWidget(control)
 
+        # 中心/远程（默认收起）——「随时监控这台电脑」那一层。中心就是他另一台常开的电脑
+        # （hub.exe），这台机器只往外连：不用公网 IP、不用配域名、不用动路由器。
+        hub_group = QGroupBox("中心/远程（随时监控这台电脑）")
+        hub_group.setCheckable(True)
+        hub_group.setChecked(False)
+        hub_layout = QVBoxLayout()
+        hub_row1 = QHBoxLayout()
+        hub_row1.addWidget(QLabel("中心地址:"))
+        self.hub_url_input = QLineEdit()
+        self.hub_url_input.setPlaceholderText("http://192.168.1.5:8760（中心那台电脑 hub.exe 屏上的一行）")
+        self.hub_url_input.setText(eng_tps.get_setting("hub_url", ""))
+        self.hub_url_input.editingFinished.connect(self._apply_hub)
+        hub_row1.addWidget(self.hub_url_input, 1)
+        hub_row1.addWidget(QLabel("令牌:"))
+        self.hub_token_input = QLineEdit()
+        # 令牌是门钥匙（拿到它就能看这几台机器的日志、勾了控制还能按按钮），
+        # 所以屏上打点；两边填的一样才连得上。
+        self.hub_token_input.setEchoMode(QLineEdit.Password)
+        self.hub_token_input.setText(eng_tps.get_setting("hub_token", ""))
+        self.hub_token_input.editingFinished.connect(self._apply_hub)
+        hub_row1.addWidget(self.hub_token_input)
+        hub_layout.addLayout(hub_row1)
+
+        hub_row2 = QHBoxLayout()
+        self.hub_on_check = QCheckBox("连到中心（心跳＋日志＋进度）")
+        self.hub_on_check.setToolTip(
+            "勾上＝这台电脑每 30 秒向中心报一次「在不在跑、跑到几个人几个号、还剩多少内存、"
+            "出口都在哪些国家」，并把屏上每行日志原样推上去；他在中心那台的网页上随时看。\n"
+            "不勾＝这层等于不存在：0 个请求、日志一行都不推。\n"
+            "中心没开/断网不影响本机抓取，日志先在内存队列里攒着（上限 4000 行），"
+            "中心回来自己补齐，序号不落空（11-18 离线自检 49 项验过）。")
+        self.hub_on_check.setChecked(eng_tps.get_setting("hub_on", "0") == "1")
+        self.hub_on_check.toggled.connect(self._apply_hub)
+        hub_row2.addWidget(self.hub_on_check)
+        self.hub_upload_check = QCheckBox("把号码也交上去（中心按号去重）")
+        self.hub_upload_check.setToolTip(
+            "「连到中心」≠「交号码」。这格不勾，中心只看进度数字，一个号码都不发出去。\n"
+            "勾了才每 15 秒把本地库里新采的那几行推上去（只读连接，抢不过抓取线程就这轮算了），"
+            "中心按 机器+行号 去重，重推不会变两条，跨机器同一个号只算一次净新增。\n"
+            "默认关：先把监控跑顺，再决定要不要把数据汇到一处。")
+        self.hub_upload_check.setChecked(eng_tps.get_setting("hub_upload", "0") == "1")
+        self.hub_upload_check.toggled.connect(self._apply_hub)
+        hub_row2.addWidget(self.hub_upload_check)
+        hub_row2.addStretch()
+        hub_layout.addLayout(hub_row2)
+
+        hub_row3 = QHBoxLayout()
+        self.hub_ctl_check = QCheckBox("允许中心控制这台（开始/暂停/恢复/停止/导入）")
+        self.hub_ctl_check.setToolTip(
+            "勾上才听中心网页上那些按钮；不勾＝中心点了也白点，这边只回一句「这台没开控制」，"
+            "程序一个按钮都不碰。\n"
+            "两头都要开才算数：中心网页右上角的「允许远程控制和分配任务」也得勾上，"
+            "少一边都下发不了（默认都是关的）。\n"
+            "「清除已导出/删已完成」这种会删东西的，中心那边必须连点两次确认，这边才动手。")
+        self.hub_ctl_check.setChecked(eng_tps.get_setting("hub_ctl", "0") == "1")
+        self.hub_ctl_check.toggled.connect(self._apply_hub)
+        hub_row3.addWidget(self.hub_ctl_check)
+        # 屏上写的机器名必须等于中心上看到的名字，不然他对不上是哪台
+        self.hub_name_label = QLabel(f"这台：{hub_client.machine_name()}｜{lan_ip()}")
+        self.hub_name_label.setStyleSheet("color:#8b949e;")
+        hub_row3.addWidget(self.hub_name_label)
+        ping_btn = QPushButton("测试一下")
+        ping_btn.setMaximumWidth(80)
+        ping_btn.clicked.connect(self.hub_ping)
+        hub_row3.addWidget(ping_btn)
+        hub_row3.addStretch()
+        hub_layout.addLayout(hub_row3)
+
+        self.hub_state = QLabel("没连（勾「连到中心」才开始报）")
+        self.hub_state.setStyleSheet("color:#8b949e;")
+        hub_layout.addWidget(self.hub_state)
+        mount(hub_group, hub_layout)
+        left_layout.addWidget(hub_group)
+
         # 统计（可折叠）—— 一行 3 组：摆 4 组会把左栏顶到 700px 以上，宽度比高度更金贵
         stats_group = QGroupBox("统计")
         stats_group.setCheckable(True)
@@ -568,6 +718,15 @@ class Main(QMainWindow):
             if not getattr(self, "_trim_warned", False):
                 self._trim_warned = True
                 write_log_file(f"[界面日志异常] {type(e).__name__}: {e}")
+        if line:
+            # 监控那一层：屏上这一行同时是「报给中心的那一行」。
+            # offer() 只做一次 put_nowait，满了丢最旧的，绝不在这条线上做网络。
+            self._last_log = str(msg)[:200]
+            try:
+                lane_egress_seen(line, self._lane_egress)
+                getattr(self, "hub", None) and self.hub.offer(line)
+            except Exception:
+                pass        # 监控层再怎么坏也不能把界面/抓取带崩
 
     def _trim_log_box(self):
         """界面只留最近 UI_LOG_LINES 行（省内存），删的是屏上的旧行，文件里全量不动。
@@ -606,6 +765,187 @@ class Main(QMainWindow):
     def _set_concurrency(self, value):
         """并发数变更（UI 线程），供后台调度线程安全读取。"""
         self._concurrency = int(value)
+
+    # ==================== 中心/远程：随时监控这台电脑 ====================
+    def _hub_note(self, msg):
+        """hub 客户端在自己那条线程里想留一行话：必须走信号回主线程，
+        Qt 不许别的线程摸控件（这条和抓取日志那条路子是同一个）。"""
+        self.bridge.log.emit(msg)
+
+    def hub_status(self):
+        """心跳带的就是这几样 —— 他说「只想随时监控」，要看的全在这里。
+        跑在中心客户端那条线程里，不占界面：stats() 实测约 70ms，30 秒一次。"""
+        try:
+            s = eng.stats() or {}
+        except Exception as e:
+            s = {}
+            self._hub_note(f"心跳取统计没取到：{type(e).__name__}")
+        return {
+            "core": core_name(),
+            "state": "running" if self.running else "idle",
+            "reason": self._last_log[:120],
+            "lanes": self._inflight,                      # 真在跑的车道，不是设定值
+            "concurrency": self._concurrency,
+            "people": int(s.get("results") or 0),         # 库里人数
+            "phones": int(s.get("phones") or 0),          # 库内全部号码
+            "deliver": int(s.get("deliver") or 0),        # 现在这版表真会写出几行
+            "done": int(s.get("done") or 0),
+            "pending": int(s.get("pending") or 0),
+            "failed": int(s.get("failed") or 0),
+            "traffic_kb": int(s.get("traffic_kb") or 0),
+            "mem_mb": free_mem_mb(),                      # 还剩多少物理内存（敢不敢再加车道看它）
+            "egress": dict(Counter(self._lane_egress.values())),
+            "ip": self._my_ip,
+            "proxy_set": bool(str(eng.get_setting("proxy", "")).strip()),
+        }
+
+    def hub_cmd(self, cmd, arg):
+        """中心按下的按钮先进队列，等主线程真做完再回执 —— 谎称做完了比不做还坏。"""
+        ev, box = threading.Event(), []
+        self._cmd_q.put((cmd, arg, ev, box))
+        if not ev.wait(30):
+            return False, "这台电脑 30 秒没回话（界面正卡在弹窗上？）"
+        return box[0] if box else (False, "没结果")
+
+    def _drain_cmds(self):
+        """主线程每秒看一眼指令队列：只有在这儿才许动界面控件。"""
+        for _ in range(3):
+            try:
+                cmd, arg, ev, box = self._cmd_q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                box.append(self._exec_cmd(cmd, arg))
+            except Exception as e:
+                box.append((False, f"{type(e).__name__}: {e}"[:150]))
+            finally:
+                ev.set()
+
+    def _exec_cmd(self, cmd, arg):
+        """远程动作 = 屏上那几个按钮，一个都不新造：走同一批函数，
+        只是把「弹窗」换成「把原因带回中心」（弹窗会把主线程卡住，那边一直等）。"""
+        if cmd == "start":
+            ok = self._start(quiet=True)
+            return ok, "已开始" if ok else "没开始（配置不完整，原因写在本机日志）"
+        if cmd == "resume":
+            if self.running:
+                return True, "本来就一直在跑，没动它"
+            ok = self._start(quiet=True)
+            return ok, "已继续（接着上次没跑完的地址）" if ok else "没能继续（配置不完整，见本机日志）"
+        if cmd == "pause":
+            if not self.running:
+                return True, "本来就没在跑"
+            self.pause()
+            return True, "已请求暂停（跑完当前地址就不再派发，可再恢复）"
+        if cmd == "stop":
+            self.stop()
+            return True, "已请求停止"
+        if cmd == "set_concurrency":
+            try:
+                n = int(str(arg).strip())
+            except ValueError:
+                return False, f"并发得填数字：{arg!r}"
+            if not 1 <= n <= 9999:
+                return False, f"并发范围 1~9999：{n}"
+            self.concurrency_input.setValue(n)        # valueChanged 自己会更新 _concurrency
+            eng.set_setting("concurrency", n)
+            return True, f"并发已按面板改成 {n}（下一批派发就按这个数）"
+        if cmd == "export":
+            return self._export(quiet=True)
+        if cmd == "retry_failed":
+            return self._retry_failed(quiet=True)
+        if cmd == "clear_exported":
+            if str(arg) != "force":
+                return False, "这条会清结果数据：中心那边要连点两次确认（带 force）我才动手"
+            return self._clear_data(quiet=True)
+        if cmd == "delete_done":
+            if str(arg) != "force":
+                return False, "这条会删地址：中心那边要连点两次确认（带 force）我才动手"
+            return self._delete_done(quiet=True)
+        if cmd == "import":
+            return self._import_payload(arg)
+        if cmd == "set_core":
+            self.core_combo.setCurrentIndex(1 if str(arg).lower().startswith("fps") else 0)
+            return True, f"核心已切到 {core_name()}"
+        if cmd == "set_age":
+            m = re.fullmatch(r"\s*(\d+)\s*[-,]\s*(\d+)\s*", str(arg))
+            if not m:
+                return False, f"年龄要写成「下限-上限」：{arg!r}"
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                return False, f"下限比上限大：{lo}-{hi}"
+            self.min_age_input.setValue(lo)
+            self.max_age_input.setValue(hi)
+            self._sync_range_settings()
+            return True, f"年龄范围 {lo}-{hi} 已写进抓取和导出（两边同一个口径）"
+        if cmd == "set_egress_log":
+            on = str(arg) == "1"
+            self.egress_check.setChecked(on)
+            eng.set_setting("log_egress_ip", "1" if on else "0")
+            return True, f"出口IP日志已{'开' if on else '关'}"
+        return False, f"这台程序没接的动作：{cmd}"
+
+    def _import_payload(self, arg):
+        """中心「分配任务」派来的那批地址，导进本机队列（走的是屏上「导入粘贴框」那条函数）。"""
+        try:
+            payload = json.loads(arg)
+            addrs = [str(a) for a in (payload.get("addrs") or []) if str(a).strip()]
+        except (ValueError, TypeError, AttributeError) as e:
+            return False, f"任务报文不对：{type(e).__name__}"
+        if not addrs:
+            return True, "这批 0 条，队列没动"
+        added = eng.import_addresses(addrs)
+        self.refresh()
+        return True, f"新增 {added} 条（送来 {len(addrs)} 条，其余库里已经有了）"
+
+    def _apply_hub(self, *_):
+        """三个勾、两个格子一改就立刻落库生效，不用等「保存配置」——
+        中心线程读的就是库里这几行，屏上显示的必须等于实际在跑的。"""
+        eng_tps.set_setting("hub_url", self.hub_url_input.text().strip())
+        eng_tps.set_setting("hub_token", self.hub_token_input.text().strip())
+        eng_tps.set_setting("hub_on", "1" if self.hub_on_check.isChecked() else "0")
+        eng_tps.set_setting("hub_upload", "1" if self.hub_upload_check.isChecked() else "0")
+        eng_tps.set_setting("hub_ctl", "1" if self.hub_ctl_check.isChecked() else "0")
+        self.hub.start()            # 从关到开：那条线程自己就起来了，不用重启程序
+        self._hub_state_text()
+
+    def _hub_state_text(self):
+        if not getattr(self, "hub_state", None) or not getattr(self, "hub", None):
+            return
+        if not self.hub.enabled():
+            self.hub_state.setText("没连（勾「连到中心」才开始报；日志照常只写本机文件）")
+            return
+        bits = [f"往中心报：{self.hub.url()}", f"已推日志 {self.hub.sent_lines} 行",
+                f"队列 {self.hub.q.qsize()}"]
+        if self.hub.dropped:
+            bits.append(f"中心不在时屏上丢了 {self.hub.dropped} 行")
+        if self.hub.fails:
+            bits.append(f"这轮没连上（连续 {self.hub.fails} 次）")
+        if self.hub.sent_rows:
+            bits.append(f"已推号码 {self.hub.sent_rows} 行")
+        bits.append("交号码" + ("开" if self.hub.upload_rows() else "关"))
+        bits.append("听控制" + ("开" if self.hub.allow_control() else "关"))
+        self.hub_state.setText("｜".join(bits))
+
+    def hub_ping(self):
+        """「测试一下」：立刻发一次心跳，不等那 30 秒。
+        故意不看「连到中心」那个勾 —— 先试通再打勾，比勾上了才发现地址填错省事。
+        放后台线程 —— 主线程做网络一卡整个界面就跟着卡。"""
+        if not self.hub.url():
+            self.log("中心地址是空的，先填 http://那台电脑的局域网IP:8760")
+            self._hub_state_text()
+            return
+        self.hub_state.setText(f"正在连 {self.hub.url()} ……")
+
+        def work():
+            try:
+                ok, msg = self.hub.ping()
+            except Exception as e:                      # 意外也不能把「正在连……」永久留在屏上
+                ok, msg = False, f"{type(e).__name__}: {e}"[:150]
+            self.bridge.log.emit(("中心连上了：" if ok else "中心没连上：") + msg)
+            self.bridge.ui.emit(self._hub_state_text)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _apply_core(self, *_):
         """面板切核心：换查询网站，同时提醒各自的成本口径。"""
@@ -651,6 +991,7 @@ class Main(QMainWindow):
         eng.set_setting("prevent_sleep", "1" if self.prevent_sleep_check.isChecked() else "0")
         eng.set_setting("sleep_timer_hours", self.sleep_timer_input.value())
         eng.set_setting("log_keep", self.log_keep_input.value())
+        self._apply_hub()          # 中心那五项本来就一改就落库；这儿再对平一次，免得他改完直接点保存
         self.log("配置已保存")
         if self.sender() and isinstance(self.sender(), QPushButton):
             QMessageBox.information(self, "保存", "配置已保存")
@@ -706,7 +1047,18 @@ class Main(QMainWindow):
         self.log(f"从文件导入 {added} 条地址")
         self.refresh()
 
+    def _warn(self, quiet, title, text):
+        """配置不完整这类拦截：屏上点 = 弹窗；中心远程点 = 绝不能弹窗
+        （弹窗把主线程卡住，那边只能等到超时），改成写一行日志 + 把原因带回中心。"""
+        self.log(f"[{title}] {text}".replace("\n", " "))
+        if not quiet:
+            QMessageBox.warning(self, title, text)
+        return False
+
     def start(self):
+        return self._start(quiet=False)
+
+    def _start(self, quiet=False):
         # 开跑前按面板重绑一次核心，后台线程提交的就是这个 eng
         pick_core(self.core_combo.currentData())
         proxy = self.proxy_input.text().strip()
@@ -716,16 +1068,13 @@ class Main(QMainWindow):
         concurrency = self.concurrency_input.value()
 
         if not proxy or not proxy_pass:
-            QMessageBox.warning(self, "配置不完整", "请填写代理模板和密码")
-            return
+            return self._warn(quiet, "配置不完整", "请填写代理模板和密码")
         if solve_captcha and not capsolver:
-            QMessageBox.warning(self, "配置不完整", "勾选了“解验证码”但未填写验证码 Key")
-            return
+            return self._warn(quiet, "配置不完整", "勾选了“解验证码”但未填写验证码 Key")
         if not self._selected_genders():
             # 一性别都不勾 = 谁都进不了详情页，跑一小时 0 人还看不出原因，当场拦住
-            QMessageBox.warning(self, "配置不完整", "「保留性别」一个都没勾，这样一个人都不会被抓。\n"
-                                                 "至少勾「男」（要女性就再加「女」）。")
-            return
+            return self._warn(quiet, "配置不完整", "「保留性别」一个都没勾，这样一个人都不会被抓。\n"
+                                                  "至少勾「男」（要女性就再加「女」）。")
 
         eng.set_setting("proxy", proxy)
         eng.set_setting("proxy_pass", proxy_pass)
@@ -769,7 +1118,8 @@ class Main(QMainWindow):
                 with ThreadPoolExecutor(max_workers=9999) as executor:
                     futures = {}
                     idx = 0
-                    queue = list(addresses)
+                    queue_ = list(addresses)     # 局部变量别叫 queue：那是标准库模块名，
+                                                 # 中心那层要 queue.Empty/Queue，撞名会炸得很难查
 
                     # allow_defer 是 FPS 引擎才有的参数：TPS(1.8.2) 那个 process_address 没有这一格，
                     # 无脑传过去 = submit 时不报错、future.result() 才抛 TypeError，
@@ -780,12 +1130,13 @@ class Main(QMainWindow):
                         if eng is eng_fps:
                             # 后面还排着别的地址才允许「弹回首页就放手」：车道不该
                             # 在这条地址上等 6 次加载（实测中位 111.8 秒），先去做下一家
-                            d["allow_defer"] = bool(queue)
+                            d["allow_defer"] = bool(queue_)
                         return d
 
-                    while queue or futures:
-                        while self.running and len(futures) < max(1, self._concurrency) and queue:
-                            addr = queue.pop(0)
+                    while queue_ or futures:
+                        self._inflight = len(futures)     # 心跳上那格「车道」= 真在跑的条数
+                        while self.running and len(futures) < max(1, self._concurrency) and queue_:
+                            addr = queue_.pop(0)
                             future = executor.submit(
                                 eng.process_address, addr, proxy, proxy_pass, capsolver,
                                 **_kw(idx))
@@ -805,7 +1156,7 @@ class Main(QMainWindow):
                             try:
                                 success, data = future.result()
                                 if success and data.get("deferred"):
-                                    queue.append(url)
+                                    queue_.append(url)
                                     self.bridge.log.emit(
                                         f"↻ {url[:34]}：{data.get('passes', 0)} 个出口弹回首页，"
                                         f"退回队尾等复测（车道已腾出来）")
@@ -832,11 +1183,13 @@ class Main(QMainWindow):
                 self.bridge.log.emit(f"启动失败: {e}")
             finally:
                 self.running = False
+                self._inflight = 0              # 心跳上那格「车道」跟着归零，别停在最后一个数
                 self.bridge.ui.emit(lambda: self.start_btn.setEnabled(True))
                 self.bridge.ui.emit(lambda: self.pause_btn.setEnabled(False))
                 self.bridge.ui.emit(lambda: self.stop_btn.setEnabled(False))
 
         threading.Thread(target=work, daemon=True).start()
+        return True
 
     def stop(self):
         self.running = False
@@ -859,6 +1212,10 @@ class Main(QMainWindow):
         self._closing = True
         self.running = False
         self._stats_timer.stop()
+        self._hub_timer.stop()
+        # 中心那一层：最后看一眼队列，能推出去的几行推出去（一次机会，推不掉就算了，
+        # 绝不能因为它把关程序卡住 —— 那边 95 秒没心跳自己就报「掉线」了）
+        self.hub.finish()
         # 内存写队列里最后那几个人必须真落盘再收浏览器（写线程是 daemon，不叫它它就带着数据走了）
         if not eng_tps.stop_writer(6):
             self.log("关闭：写库队列 6 秒没排空，最后几个人可能没进库")
@@ -870,51 +1227,81 @@ class Main(QMainWindow):
         ev.accept()
 
     def clear_data(self):
-        """清除已导出的结果数据（地址保留）。"""
-        reply = QMessageBox.question(
-            self, "确认清除",
-            "确定要清除所有已采集的结果数据吗？\n（地址列表保留，仅清除结果）",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
+        return self._clear_data(quiet=False)
+
+    def _clear_data(self, quiet=False):
+        """清除已导出的结果数据（地址保留）。quiet=True 是中心远程点的：不弹窗，结果带回中心。"""
+        if not quiet:
+            reply = QMessageBox.question(
+                self, "确认清除",
+                "确定要清除所有已采集的结果数据吗？\n（地址列表保留，仅清除结果）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return False, "他自己取消了（屏上那个确认框没点是）" if quiet else None
         with eng.connect() as con:
             deleted = con.execute("DELETE FROM results").rowcount
             con.execute("UPDATE addresses SET status='pending',records=0,people=0,phones=0,traffic_kb=0,error='' WHERE status='done'")
         self.log(f"已清除 {deleted} 条结果，地址状态已重置")
+        if quiet:
+            return True, f"已清除 {deleted} 条结果（地址保留、状态已回待处理）"
         QMessageBox.information(self, "清除", f"已清除 {deleted} 条结果")
         self.refresh()
+        return True, f"已清除 {deleted} 条结果"
 
     def retry_failed(self):
+        return self._retry_failed(quiet=False)
+
+    def _retry_failed(self, quiet=False):
         """把失败的地址重置为待处理，排到队尾重新跑。"""
         with eng.connect() as con:
             count = con.execute("UPDATE addresses SET status='pending', error='' WHERE status='failed'").rowcount
         self.log(f"已重置 {count} 个失败地址为待处理")
+        if quiet:
+            return True, f"{count} 个失败地址已排到队尾"
         QMessageBox.information(self, "重试", f"{count} 个失败地址已排到队尾")
         self.refresh()
+        return True, f"{count} 个失败地址已排到队尾"
 
     def delete_done(self):
+        return self._delete_done(quiet=False)
+
+    def _delete_done(self, quiet=False):
         """删除已成功采集的地址（结果保留在 CSV 里）。"""
-        reply = QMessageBox.question(
-            self, "确认删除",
-            "确定要删除所有已完成的地址吗？\n（结果数据保留，仅删除地址记录）",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
+        if not quiet:
+            reply = QMessageBox.question(
+                self, "确认删除",
+                "确定要删除所有已完成的地址吗？\n（结果数据保留，仅删除地址记录）",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return False, "他自己取消了（屏上那个确认框没点是）"
         with eng.connect() as con:
             count = con.execute("DELETE FROM addresses WHERE status='done'").rowcount
         self.log(f"已删除 {count} 个已完成地址")
+        if quiet:
+            return True, f"已删除 {count} 个已完成地址（结果数据没动）"
         QMessageBox.information(self, "删除", f"已删除 {count} 个地址")
         self.refresh()
+        return True, f"已删除 {count} 个地址"
 
     def export(self):
-        path, _ = QFileDialog.getSaveFileName(self, "导出", str(BASE), "CSV (*.csv)")
-        if not path:
-            return
+        return self._export(quiet=False)
+
+    def _export(self, quiet=False):
+        """导出 CSV。quiet=True（中心远程点的）没有对话框可弹 ⇒
+        固定落到这台电脑程序同级的 导出_时间戳.csv，并把完整路径带回中心。"""
+        if quiet:
+            path = str(BASE / f"导出_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        else:
+            path, _ = QFileDialog.getSaveFileName(self, "导出", str(BASE), "CSV (*.csv)")
+            if not path:
+                return False, "没选保存路径"
         out, count = eng.export_csv(path)
         self.log(f"导出 {count} 条 → {out}")
-        QMessageBox.information(self, "导出", f"已导出 {count} 条")
+        if not quiet:
+            QMessageBox.information(self, "导出", f"已导出 {count} 条")
+        return True, f"导出 {count} 条 → {Path(out).name if hasattr(out, 'name') else out}"
 
     def export_addrs(self, statuses, label):
         path, _ = QFileDialog.getSaveFileName(self, f"导出{label}地址", str(BASE), "Text (*.txt)")
@@ -953,6 +1340,9 @@ class Main(QMainWindow):
             self.stats_labels["runtime"].setText("00:00:00")
             self.stats_labels["hourly"].setText("0 地址/时")
             self.stats_labels["speed"].setText("0 条/分")
+        # 中心那一行的「已推多少行 / 队列积压 / 交号码开没开」跟着统计一起刷，
+        # 屏上显示的必须等于实际在报的（只是拼个字符串，不碰网络）。
+        self._hub_state_text()
 
 
 def _selftest():
