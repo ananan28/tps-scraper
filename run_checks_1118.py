@@ -31,9 +31,12 @@ JOBS = [
 
 
 def main():
+    only = sys.argv[1:]          # 可以只补跑其中几份：python run_checks_1118.py 中心EXE
+    jobs = [j for j in JOBS if not only or any(k in j[0] for k in only)]
+    assert jobs, f"没匹配到要跑的实测项：{only}（可选项：{[j[0] for j in JOBS]}）"
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     rows = []
-    for name, args, desc in JOBS:
+    for name, args, desc in jobs:
         cmd = [sys.executable, "-X", "utf8"] + [str(BASE / a) for a in args]
         print(f"跑 {args[0]} ...", flush=True)
         r = subprocess.run(cmd, cwd=str(BASE), capture_output=True, timeout=1800)
@@ -54,7 +57,8 @@ def main():
         rows.append((name, ok))
         assert ok, f"{args[0]} 没过，不许铺包（详情看 {OUT / name}）"
     tot = sum(1 for _, o in rows if o)
-    print(f"\n✓ {tot}/{len(JOBS)} 份实测记录已落 {OUT}")
+    print(f"\n✓ {tot}/{len(jobs)} 份实测记录已落 {OUT}"
+          + ("（只补跑了选中的那几份）" if only else ""))
 
 
 if __name__ == "__main__":
