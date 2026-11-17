@@ -15,7 +15,7 @@ if getattr(sys, "frozen", False):
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_browsers)
 
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -48,6 +48,7 @@ BASE = Path(__file__).resolve().parent
 _LOG_DIR = eng_tps.BASE / "logs"
 _log_file = [None]
 _log_fh = [None]
+UI_LOG_LINES = 200           # 界面日志框最多显最近 200 行（省内存），文件里不受这个数限制
 LOG_KEEP_DEFAULT = 60        # 默认保留最近 60 份运行日志（一次启动一份，天天跑也够存两个月）
 
 
@@ -171,7 +172,8 @@ class Main(QMainWindow):
             keep = int(eng_tps.get_setting("log_keep", LOG_KEEP_DEFAULT))
         except (TypeError, ValueError):
             keep = LOG_KEEP_DEFAULT
-        self.log(f"就绪｜日志边写边存：{p}（界面只显 200 行，文件里全程都在；"
+        self.log(f"就绪｜日志边写边存：{p}（界面只显最近 {UI_LOG_LINES} 行，超出的旧行自动从屏上收掉；"
+                 f"文件里全程都在；"
                  f"{f'保留最近 {keep} 份，启动时只删最旧的，当前这份永不动' if keep > 0 else '填了 0：一份都不删，磁盘自己盯'}）")
 
     def build(self):
@@ -543,18 +545,37 @@ class Main(QMainWindow):
             line = f"[{timestamp}] {msg}"
             write_log_file(line)
             self.log_box.append(line)
-            # 界面只留最近 200 行（省内存）——文件里是全的，删的是屏上的旧行
-            doc = self.log_box.document()
-            if doc.blockCount() > 200:
-                cursor = self.log_box.textCursor()
-                cursor.movePosition(cursor.Start)
-                for _ in range(doc.blockCount() - 200):
-                    cursor.movePosition(cursor.Down, cursor.KeepAnchor)
-                cursor.removeSelectedText()
-                cursor.deleteChar()
-        except RuntimeError:
+            self._trim_log_box()
+        except Exception as e:
+            # 屏上出问题时也别把抓取线程带崩：文件里那句已经落了
             if line:
                 write_log_file(line)
+            if not getattr(self, "_trim_warned", False):
+                self._trim_warned = True
+                write_log_file(f"[界面日志异常] {type(e).__name__}: {e}")
+
+    def _trim_log_box(self):
+        """界面只留最近 UI_LOG_LINES 行（省内存），删的是屏上的旧行，文件里全量不动。
+        注意：PySide6 6.12 里 QTextCursor 实例拿不到 cursor.Start 这种简写（只有类上有），
+        以前写 cursor.Start 一超 200 行就抛 AttributeError，结果屏幕越滚越长、还悄悄报错，
+        所以这里一律用全限定枚举，并且不碰 deleteChar（那句会把留下那行的首字符吃掉）。"""
+        doc = self.log_box.document()
+        extra = doc.blockCount() - UI_LOG_LINES
+        if extra <= 0:
+            return
+        cursor = self.log_box.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.movePosition(QTextCursor.MoveOperation.Down,
+                            QTextCursor.MoveMode.KeepAnchor, extra)
+        cursor.removeSelectedText()
+        # 删完还可能差一行（文档末尾那个空块算不算一行，Qt 有时给有时不给），补一刀截到位
+        for _ in range(4):
+            if doc.blockCount() <= UI_LOG_LINES:
+                break
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(QTextCursor.MoveOperation.Down,
+                                QTextCursor.MoveMode.KeepAnchor, 1)
+            cursor.removeSelectedText()
 
     def clear_log(self):
         """手动清除界面日志（文件里一个字不动）"""
