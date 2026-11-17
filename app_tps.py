@@ -753,16 +753,24 @@ class Main(QMainWindow):
                     idx = 0
                     queue = list(addresses)
 
+                    # allow_defer 是 FPS 引擎才有的参数：TPS(1.8.2) 那个 process_address 没有这一格，
+                    # 无脑传过去 = submit 时不报错、future.result() 才抛 TypeError，
+                    # 于是 TPS 核心每条地址都瞬间「失败」，看着就像根本不调度（11-17 就是这么坏过一次）。
+                    def _kw(i):
+                        d = dict(worker_id=i, progress_cb=on_progress,
+                                 max_attempts=max_attempts, solve_captcha=solve_captcha)
+                        if eng is eng_fps:
+                            # 后面还排着别的地址才允许「弹回首页就放手」：车道不该
+                            # 在这条地址上等 6 次加载（实测中位 111.8 秒），先去做下一家
+                            d["allow_defer"] = bool(queue)
+                        return d
+
                     while queue or futures:
                         while self.running and len(futures) < max(1, self._concurrency) and queue:
                             addr = queue.pop(0)
                             future = executor.submit(
                                 eng.process_address, addr, proxy, proxy_pass, capsolver,
-                                worker_id=idx, progress_cb=on_progress,
-                                max_attempts=max_attempts, solve_captcha=solve_captcha,
-                                # 后面还排着别的地址才允许「弹回首页就放手」：车道不该
-                                # 在这条地址上等 6 次加载（实测中位 111.8 秒），先去做下一家
-                                allow_defer=(eng is eng_fps and bool(queue)))
+                                **_kw(idx))
                             futures[future] = addr
                             idx += 1
 
