@@ -591,6 +591,17 @@ class Main(QMainWindow):
 
     # ---------------------------------------------------------------- 调度用的库口子
     # 这几条都是「一次一小步」的读写：调度线程一边跑一边回库里捞，绝不一次性把列表读死。
+    def _pull_size(self):
+        """一批只捞「并发×2」条，不是一口气把整库待处理全占住。
+        占位标太狠有两个后果（11-19 早上他这场就是）：屏上「运行中」变成排队数
+        （94 条里 92 条压根没派发，关窗口时整批退回待处理），而且这一批排空之前
+        新导入的、点「重试失败」捡回来的地址都进不了队。"""
+        try:
+            n = int(self._concurrency) * 2
+        except (TypeError, ValueError):
+            n = PULL_BATCH
+        return max(2, min(PULL_BATCH, n))
+
     def _claim_pending(self, n):
         """从库里取 n 条待处理并当场标成「运行中」占住。
         为什么要占位：批批回库捞时，正在跑的那几条必须别再被下一批捞回去重复跑
@@ -730,7 +741,7 @@ class Main(QMainWindow):
                         # 底版只在开跑时读一次 `status='pending' LIMIT 1000`，
                         # 地址超过 1000 条时后面的这条根本没人管，跑满 1000 就报「完成」。
                         if not queue:
-                            queue.extend(self._claim_pending(PULL_BATCH))
+                            queue.extend(self._claim_pending(self._pull_size()))
 
                         while self.running and len(futures) < max(1, self._concurrency) and queue:
                             addr = queue.pop(0)

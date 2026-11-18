@@ -13,9 +13,9 @@ import engine_fps as fps
 bad = 0
 
 
-def check(name, cond):
+def check(name, cond, detail=""):
     global bad
-    print(f"  {'ok  ' if cond else 'FAIL'} {name}")
+    print(f"  {'ok  ' if cond else 'FAIL'} {name}{('｜' + str(detail)[:120]) if detail else ''}")
     if not cond:
         bad += 1
 
@@ -126,6 +126,55 @@ print("== 四、确认页短文案也要中（防只匹配长句） ==")
 check("光标题 are you human 也算", "humancheck" ==
       fps.page_state("<html><title>x</title>are you human</html>") or
       fps.page_state("<html><title>x</title>ARE YOU HUMAN?</html>") == "humancheck")
+
+print("== 五、11-19：验证页等不动就换出口，不再同一条出口重载三次 ==")
+
+BOUNCED = ('<html><title>Free People Search | FastPeopleSearch.com</title><body>'
+           '<div>Find People, Phone Numbers, Address History</div></body></html>')
+
+
+class CountTab(FakeTab):
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.gets = 0
+
+    async def get(self, url):
+        self.gets += 1
+        return None
+
+
+async def fetch_probe(payload, timeout_s, rotations, hb):
+    """跑一次 _fetch，回报（抛的异常名/返回值, 秒, 加载次数, 日志行）"""
+    tab = CountTab(payload)
+    lines = []
+    old_hb = fps.WAIT_HEARTBEAT_S
+    fps.WAIT_HEARTBEAT_S = hb
+    t0 = time.time()
+    try:
+        got = await fps._fetch(tab, FakeRelay(), "u", "listing", lines.append,
+                               timeout_s, rotations, "s")
+        out = ("return:" + ("空" if got == "" else "有内容"), round(time.time() - t0, 1))
+    except Exception as exc:
+        out = (type(exc).__name__, round(time.time() - t0, 1))
+    finally:
+        fps.WAIT_HEARTBEAT_S = old_hb
+    return out[0], out[1], tab.gets, lines
+
+
+name, secs, gets, lines = run(fetch_probe(CHALLENGE, 4, 2, 2))
+check(f"挑战页等满就抛 FpsNeedNewIp（实测 {name} {secs}s）", name == "FpsNeedNewIp")
+check(f"只加载 1 次，不再拿同一条出口重载 3 次（实测 gets={gets}）", gets == 1)
+check(f"一条页的最坏占用从 4×3+重载=约 18s 降到 {secs}s（<8s 才算真不重载）", secs < 8)
+check("等待期有心跳行（屏上能看出这条车道还活着）",
+      any("还在等这一页" in l for l in lines), "｜".join(lines)[:120])
+
+name, secs, gets, lines = run(fetch_probe(BOUNCED, 4, 2, 2))
+check(f"被弹回首页仍走满 {2 + 1} 次重载才判没人（判无人的证据链没被我这刀砍坏）",
+      name == "return:空" and gets == 3, f"{name} gets={gets}")
+
+name, secs, gets, _ = run(fetch_probe(CARD_PAGE, 4, 2, 2))
+check("正常页一次加载就返回，新判定没给它多加等待",
+      name == "return:有内容" and gets == 1, f"{name} gets={gets}")
 
 print(f"\n合计不过 {bad} 项")
 sys.exit(1 if bad else 0)

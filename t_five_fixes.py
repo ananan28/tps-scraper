@@ -526,6 +526,44 @@ def main():
     # ---------------------------------------------------------------- T8 解码请求
     run_t8(app_tps, eng_tps)
 
+    # ---------------------------------------------------------------- T9 一批只捞 并发×2
+    # 他 11-19 早上那场：屏上「运行中 94」，其中 92 条压根没派发（关窗口时整批退回待处理，
+    # 库里 updated_at 就是那一刻），于是「十车道跑着跑着只剩两个」根本没法从界面上看出来。
+    win = make_win(app_tps, 60, tag="claim")
+    peak_running = [0]
+    disp9 = []
+    real_time9 = app_tps.time
+    app_tps.time = NoSleep(real_time9)
+
+    def fake_claim_probe(address, *a, **kw):
+        disp9.append(address)
+        con = sqlite3.connect(str(DB))
+        n = con.execute("SELECT COUNT(*) FROM addresses WHERE status='running'").fetchone()[0]
+        peak_running[0] = max(peak_running[0], n)
+        con.execute("UPDATE addresses SET status='done' WHERE address=?", (address,))
+        con.commit()
+        con.close()
+        time.sleep(0.02)
+        return True, {"people": 1, "phones": 1, "traffic_kb": 1}
+
+    eng_tps.process_address = fake_claim_probe
+    try:
+        win.concurrency_input.setValue(4)
+        got_size = app_tps.Main._pull_size(win)
+        check("T9 并发 4 ⇒ 一批只占 8 条（不再一次占 60/200 条）", got_size == 8, f"实测 {got_size}")
+        win.start()
+        done9 = wait_finished(win, 120)
+        pump(win, 0.5)
+        check("T9 跑动中「运行中」峰值 ≤ 并发×3（4 车道 ⇒ ≤12；底版一次占满 60 条整库）",
+              done9 and len(disp9) == 60 and peak_running[0] <= 12,
+              f"派发 {len(disp9)}/60，运行中峰值 {peak_running[0]}（上限 12，底版=60）")
+        left9 = status_counts().get("pending", 0)
+        check("T9 改小批量后 60 条照样一条不落（自动续批没退化）", left9 == 0, f"还剩 {left9}")
+    finally:
+        eng_tps.process_address = real_proc
+        app_tps.time = real_time9
+        close_win(win)
+
     bad = [r for r in RESULTS if not r[0]]
     print(f"\n合计 {len(RESULTS)} 项｜过 {len(RESULTS) - len(bad)}｜不过 {len(bad)}")
     for _, n, d in bad:

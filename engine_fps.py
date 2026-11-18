@@ -82,6 +82,9 @@ HUMAN_CHECK_MARKERS = ("are you human", "please fill out the re-captcha",
 # 白页（一个字都没收到）最多等多久。11-17 实测一轮 189 次白页：中位 4 秒开始流、
 # 最长 87 秒；120 秒一刀切在本批一次都没砍掉过真到位的页，却能把吞请求的死出口提前放掉。
 BLANK_WAIT_S = 120
+# 等一页到位期间，屏上每这么多秒补一行心跳。他盯着屏幕看窗口，不出声就分不清这条车道
+# 是死了还是在等验证页（11-19「跑着跑着只剩两个车道」有一半就是这么被读没的）。
+WAIT_HEARTBEAT_S = 30
 
 # 实测定案：只拦图片+媒体（按扩展名），字体/样式放行；全拦会把挑战摊薄弄坏
 BLOCK_URL_PATTERNS = ["*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.svg", "*.ico",
@@ -348,6 +351,7 @@ async def _fetch(tab, relay, url, kind, log, timeout_s, rotations, sid_base):
         else:
             t0 = time.time()
             last_state = ""
+            beats = 0
             while True:
                 content = await _content(tab)
                 state = page_state(content, kind)
@@ -402,10 +406,21 @@ async def _fetch(tab, relay, url, kind, log, timeout_s, rotations, sid_base):
                     log(f"这页内容还没到位（{state} {len(content or '')} 字节，"
                         f"标题『{_title_of(content)[:40]}』）")
                     last_state = state
+                waited = int(time.time() - t0)
+                if waited // WAIT_HEARTBEAT_S > beats:
+                    beats += 1
+                    log(f"还在等这一页（{state} 已等 {waited}s，最多 {int(timeout_s)}s，"
+                        f"流量:{relay.bytes_transferred // 1024}KB）")
                 if time.time() - t0 >= timeout_s:
-                    last_err = f"{int(time.time() - t0)} 秒没出内容（{state}）"
-                    log(f"{last_err}，同出口重载重试（{relay.bytes_transferred // 1024}KB）")
-                    break
+                    # 11-19 定案：等满 challenge_wait 还在同一条出口上重载 = 纯白等。
+                    # 实测同一条 IP 重载一次，CF 的题就从头再排一次（11-16 那次 31 条限流页
+                    # 每条都是秒认秒换才跑得快），所以「重载 2 次」把一个页的最坏占用从 200 秒
+                    # 抬到 200×3=600 秒，再乘一条地址的 12 次尝试 = 一条车道能冻两小时 ——
+                    # 「十车道跑着跑着只剩两个」和「图二那个界面卡很久」就是这个。
+                    # 等不动 = 这条出口不行，直接抛出去让外层整副浏览器重开换新出口。
+                    # （「被弹回首页」不走这里：同出口重载才是判「这地址真没人」的证据，保留。）
+                    raise FpsNeedNewIp(f"{waited} 秒没出内容（{state} {len(content or '')} 字节，"
+                                       f"{relay.bytes_transferred // 1024}KB）")
                 await asyncio.sleep(4)
         if rot >= rotations:
             if last_err == "被弹回首页":
