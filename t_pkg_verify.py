@@ -98,6 +98,10 @@ checks = [
     ("engine_tps182", "2Captcha 拒收任务", "厂家原话落日志（修「付费解码查不出原因」）"),
     ("engine_tps182", "这次不解码", "不解码必说一句原因"),
     ("engine_fps", "_log_egress", "FPS 每车道报出口"),
+    ("engine_fps", "humancheck", "站点「Are you human?」确认页有独立档（11-18 他 8 张截图）"),
+    ("engine_fps", "reCAPTCHA 确认页", "确认页报错那句带原因"),
+    ("engine_fps", "_is_blank", "全白页单列档（修「空白页白等 201s」）"),
+    ("engine_fps", "重开浏览器换出口", "白页/死口到点换出口那句话在"),
 ]
 for mod, needle, what in checks:
     hay = "\n".join(strings_of(mod))

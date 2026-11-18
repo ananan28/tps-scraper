@@ -27,6 +27,10 @@ ALLOW_CHANGED = {
         "_log_egress",                    # 新增：FPS 每车道出口IP
         "_run_attempt",                   # 挂一行探活
         "process_address",                # 备 upstream 串
+        "_fetch",                         # 11-18 晚：确认页/白页/出口死口 立刻换出口，不再白等
+        "_hard_page_state",               # 多认一个 humancheck 档
+        "page_state",                     # blank 档 + residents 容器算到位
+        "_is_blank",                      # 新增：全白页判定
     },
 }
 

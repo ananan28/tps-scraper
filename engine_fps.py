@@ -71,6 +71,17 @@ RATE_BODY_MARKERS = ("rate limit exceeded", "you have exceeded the amount of req
 # CF 硬拒页：标题是 attention required 但正文写的是「你已经被拒」，不是「正在验证」
 HARD_BLOCK_MARKERS = ("sorry, you have been blocked", "you've been blocked",
                       "you are unable to access")
+# 站点自己的「Are you human?」reCAPTCHA 确认页（11-18 他实测 8 张截图里 3 张是它：
+# 「Verifying...」卡死、「Verify you are human」复选、「Verification failed」三种姿态）。
+# 它不带 _cf_chl_opt，所以不是 Cloudflare 那种等 90~165 秒会自过的题；必须真解题才能过，
+# 而 FPS 全程没接打码（2Captcha 对这站的票四姿势全拒、$0 扣款，11-15 实测定案打码是死路）。
+# 正文自己写了「是你这条 IP 有异常」⇒ 能做的正确反应是换新出口重试，
+# 而不是同一条 IP 白等满 200 秒 × 重载 × 12 副浏览器。
+HUMAN_CHECK_MARKERS = ("are you human", "please fill out the re-captcha",
+                       "confirm that you are not a bot")
+# 白页（一个字都没收到）最多等多久。11-17 实测一轮 189 次白页：中位 4 秒开始流、
+# 最长 87 秒；120 秒一刀切在本批一次都没砍掉过真到位的页，却能把吞请求的死出口提前放掉。
+BLANK_WAIT_S = 120
 
 # 实测定案：只拦图片+媒体（按扩展名），字体/样式放行；全拦会把挑战摊薄弄坏
 BLOCK_URL_PATTERNS = ["*.jpg", "*.jpeg", "*.png", "*.gif", "*.webp", "*.svg", "*.ico",
@@ -147,8 +158,24 @@ def _is_challenge(content):
     return any(k in text for k in CF_BODY_MARKERS)
 
 
+def _is_blank(text):
+    """一个字都没收到（或只有 Chrome 的空壳）。
+    实测坑（11-17 他截图 304 Hillcrest Dr 整屏全白、11-18 又报 about:blank 和
+    「Security Challenge」全白两姿）：这种页以前被 _is_challenge 里
+    「没标题就算验证页」那一行认成 challenge，日志写成验证页，还白等满 201 秒。
+    本轮 189 次白页实测：中位 4 秒就有内容进来，最长 87 秒；所以它既不是验证页，
+    也不该跟验证页共用 200 秒预算。
+    只认「没标题 + 没任何页面标记 + 不足 200 字节」：有标题或撞出验证/限流字样的
+    一律放行给后面的判定，免得把半截的真验证页误当成白页提前换出口。"""
+    t = (text or "").strip()
+    if len(t) >= 200 or _title_of(t):
+        return False
+    low = t.lower()
+    return not any(k in low for k in CF_BODY_MARKERS + RATE_BODY_MARKERS + HARD_BLOCK_MARKERS)
+
+
 def _hard_page_state(text):
-    """限流/拉黑页返回 ratelimited / hardblock，其它返回 ""。
+    """限流/拉黑/站点确认页返回 ratelimited / hardblock / humancheck，其它返回 ""。
     带 _cf_chl_opt 的一律不当硬页：那是会自过的真挑战，等是对的。"""
     low = (text or "").lower()
     if CHL_OPT_MARKER in low:
@@ -158,11 +185,14 @@ def _hard_page_state(text):
         return "ratelimited"
     if any(k in low for k in HARD_BLOCK_MARKERS):
         return "hardblock"
+    if any(k in low for k in HUMAN_CHECK_MARKERS):
+        return "humancheck"
     return ""
 
 
 def page_state(content, kind="listing"):
-    """challenge=验证页 / ratelimited=这 IP 被限流 / hardblock=这 IP 被拉黑 /
+    """blank=一个字都没收到 / challenge=验证页 / ratelimited=这 IP 被限流 /
+    hardblock=这 IP 被拉黑 / humancheck=站点自己的确认页 /
     bounced=被弹回首页 / neterror=出口断连报错页 / loading=标题对了但内容还在流 / ready=内容到位"""
     text = content or ""
     low = text.lower()
@@ -171,6 +201,8 @@ def page_state(content, kind="listing"):
     hard = _hard_page_state(text)
     if hard:
         return hard
+    if _is_blank(text):
+        return "blank"
     if _is_challenge(text):
         return "challenge"
     if _title_of(text) == HOME_TITLE:
@@ -178,7 +210,12 @@ def page_state(content, kind="listing"):
     if kind == "person":
         ok = 'id="full_name_section"' in text or 'id="phone_number_section"' in text
     else:
-        ok = '"card" id=' in text
+        # 实测坑（11-17 他截图：14312 Hiseville Ct, Frisco TX 新房 2025 年建）：页面是**真到位**的
+        # 地址页，有 Property Details、有面包屑，但一个住户都没有 ⇒ 一张 "card" id= 都找不到。
+        # 旧判定只认卡片，于是这页被当 loading 白等满 200 秒 × 重载 3 次 × 最多 12 副浏览器。
+        # 居民容器 id="residents" 在真地址页上一定存在（有人的页面里它就在卡片上方），
+        # 所以容器到位 = 页面到位，有没有人交给 parse_listing 去数。
+        ok = '"card" id=' in text or 'id="residents"' in text
     return "ready" if ok else "loading"
 
 
@@ -298,7 +335,8 @@ async def _fetch(tab, relay, url, kind, log, timeout_s, rotations, sid_base):
     relay.set_session 换 sid 换不动出口 IP，隧道复用，所以这里换的只是重载次数）。
 
     返回 ""：换着重载还是被弹回首页 —— 这才是「这地址真没人」的唯一证据。
-    抛 FpsNeedNewIp：撞上限流/拉黑硬页，必须整副浏览器重开才换得到 IP。
+    抛 FpsNeedNewIp：撞上等待也白等的页（限流/拉黑/站点确认页/白页超时/出口死口），
+    必须整副浏览器重开才换得到 IP。
     抛 FpsBlocked：验证页压不住 —— 绝不能当成没人。
     """
     last_err = ""
@@ -322,23 +360,44 @@ async def _fetch(tab, relay, url, kind, log, timeout_s, rotations, sid_base):
                 if state == "neterror":
                     code = next((k.upper() for k in NETERR_MARKERS
                                  if k in (content or "").lower()), "NETERR")
-                    last_err = f"出口断连 {code}"
+                    # 11-15 定案就是「neterror 秒换 IP」：出口死口时同一条出口重载还是死口，
+                    # 白烧几次加载（实测那条 36MB 的教训）。直接抛，让外层整副浏览器重开换新出口。
                     log(f"页面报 {code}（出口死口，不是这地址没人）"
-                        f"，不等了直接重载重试（{relay.bytes_transferred // 1024}KB）")
-                    break
-                if state in ("ratelimited", "hardblock"):
+                        f"⇒ 不等不重载，立刻重开浏览器换出口"
+                        f"（{relay.bytes_transferred // 1024}KB）")
+                    raise FpsNeedNewIp(f"出口断连 {code}（{len(content or '')} 字节，"
+                                       f"{relay.bytes_transferred // 1024}KB）")
+                if state in ("ratelimited", "hardblock", "humancheck"):
                     # 立刻再看一眼确认（只有可能是半加载撞字样时才会翻案），是硬页就绝不等：
-                    # 这两类页不带 _cf_chl_opt，不是会自过的挑战，等到天黑也原样返回。
+                    # 这几类页不带 _cf_chl_opt，不是会自过的挑战，等到天黑也原样返回。
                     again = await _content(tab)
                     state2 = page_state(again, kind)
                     if state2 == state:
+                        why = {"ratelimited": "出口 IP 被限流", "hardblock": "出口 IP 被拉黑",
+                               "humancheck": "站点自己的 reCAPTCHA 确认页"
+                                             "（正文写「是你这条 IP 有异常」，不解题过不去）"}[state]
                         raise FpsNeedNewIp(
-                            f"出口 IP 被{'限流' if state == 'ratelimited' else '拉黑'}"
-                            f"（标题『{_title_of(content)[:26]}』 {len(content or '')} 字节，"
+                            f"{why}（标题『{_title_of(content)[:26]}』 {len(content or '')} 字节，"
                             f"{relay.bytes_transferred // 1024}KB）")
                     content, state = again, state2
                     if state == "ready":
                         return content
+                if state == "blank":
+                    # 全白页：请求发出去了但一个字节都没回来。以前落到 _is_challenge 的
+                    # 「没标题=验证页」那一行，于是日志写 challenge、白等满 201 秒（他截图的
+                    # 「进不去」就是这种）。先等它开始流（实测中位 4 秒），但只给 BLANK_WAIT_S，
+                    # 过点还是全白 = 这条出口把请求吞了，直接重开浏览器换新出口。
+                    if time.time() - t0 >= BLANK_WAIT_S:
+                        secs = int(time.time() - t0)
+                        log(f"白页 {secs} 秒一个字都没收到（{relay.bytes_transferred // 1024}KB）"
+                            f"⇒ 不等验证页那 200 秒，重开浏览器换出口")
+                        raise FpsNeedNewIp(f"白页 {secs} 秒零字节（{relay.bytes_transferred // 1024}KB）")
+                    if last_state != state:
+                        log(f"全白页，一个字都没收到（已等 {int(time.time() - t0)}s，"
+                            f"{relay.bytes_transferred // 1024}KB）")
+                        last_state = state
+                    await asyncio.sleep(2)
+                    continue
                 if state != last_state:
                     log(f"这页内容还没到位（{state} {len(content or '')} 字节，"
                         f"标题『{_title_of(content)[:40]}』）")
