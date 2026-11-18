@@ -16,6 +16,8 @@ import requests
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
+import egress_ip as egress     # 只给日志用：这条车道当前出口 IP + 归属地（标准库，不拖依赖）
+
 # 打包(frozen)时：Windows 数据放 EXE 同级目录；macOS 放 ~/Library/Application Support（.app 包内不宜写库）；源码运行放脚本目录
 if getattr(sys, "frozen", False):
     if sys.platform == "darwin":
@@ -485,10 +487,22 @@ def build_upstream_proxy(proxy_template, proxy_pass, session):
     return f"http://{user}:{proxy_pass}@{base.hostname}:{base.port or 80}"
 
 
-def twocaptcha_turnstile_proxied(page_url, upstream_proxy, api_key, action=None):
+def twocaptcha_turnstile_proxied(page_url, upstream_proxy, api_key, action=None, log=None):
     """2Captcha 带代理解 Turnstile：token 绑定我们的出口 IP。
     TPS 用 action='900' 渲染，必须带上否则服务端拒收。
+
+    11-18 补：每一刀失败都要把 2Captcha 原话报到日志里。以前这里不管厂家回
+    ERROR_KEY_DOES_NOT_EXIST / ERROR_ZERO_BALANCE / ERROR_CAPTCHA_UNSOLVABLE 还是超时，
+    一律 `return None`，界面上只剩干巴巴一句「2Captcha 未返回 token」——
+    于是「付费解码不灵」永远查不出原因，只能瞎猜。现在厂家说什么就写什么。
     """
+    def _log(m):
+        if log:
+            try:
+                log(m)
+            except Exception:
+                pass
+
     parts = urllib.parse.urlsplit(upstream_proxy)
     proxy_str = f"{parts.username or ''}:{parts.password or ''}@{parts.hostname or ''}:{parts.port or 80}"
     params = {
@@ -504,21 +518,30 @@ def twocaptcha_turnstile_proxied(page_url, upstream_proxy, api_key, action=None)
         params["data-s"] = str(action)
     try:
         result = requests.post(f"{TWOCAPTCHA_API_URL}/in.php", data=params, timeout=30).json()
-    except Exception:
+    except Exception as exc:
+        _log(f"    解码请求发不出去（{type(exc).__name__}），这一下没花钱")
         return None
     if result.get("status") != 1:
+        _log(f"    2Captcha 拒收任务：{str(result)[:160]}"
+             f"（Key 是否有效／余额够不够都在这一句里）")
         return None
     task_id = result["request"]
+    _log(f"    2Captcha 已接单 id={str(task_id)[:24]}，等 token（最多 {40 * 2} 秒）")
     for _ in range(40):
         time.sleep(2)
         try:
             result = requests.get(f"{TWOCAPTCHA_API_URL}/res.php",
                                   params={"key": api_key, "action": "get", "id": task_id, "json": "1"},
                                   timeout=30).json()
-        except Exception:
+        except Exception as exc:
+            _log(f"    取结果失败（{type(exc).__name__}），任务 id={str(task_id)[:16]} 还挂在厂家")
             return None
         if result.get("status") == 1:
             return result["request"]
+        if str(result.get("request", "")).startswith("ERROR"):
+            _log(f"    2Captcha 解不出来：{str(result)[:160]}")
+            return None
+    _log(f"    等了 {40 * 2} 秒厂家还没回 token（这一单已经花钱了，任务 id={str(task_id)[:16]}）")
     return None
 
 
@@ -594,9 +617,10 @@ def try_solve_challenge(page, upstream_proxy, api_key, origin_url=None, log=None
             return False
         action = info.get("action")
         _log(f"    TPS 验证码表单 action={action}，开始解...")
-        token = twocaptcha_turnstile_proxied(page.url, upstream_proxy, api_key, action=action)
+        token = twocaptcha_turnstile_proxied(page.url, upstream_proxy, api_key, action=action,
+                                             log=_log)
         if not token:
-            _log("    2Captcha 未返回 token")
+            _log("    这次没拿到 token（原因见上面那句厂家的话），不发第二次钱")
             return False
         _log(f"    拿到 token ({len(token)} chars)，提交 captchaToken...")
         try:
@@ -772,6 +796,16 @@ def scrape_detail(page, person, address, now):
             hard = hard_page_kind(page)
             # 硬页（限流/拉黑）打码解不了，白花钱还白等；会自过的挑战才值得解（同 1.8.2）
             can_solve = (up and getattr(scrape_detail, "solve_captcha", True) and not hard)
+            if not can_solve and prog:
+                # 底版这里悄悄就不解码了，界面一个字不写，于是「明明勾了解码却没解」根本看不出来。
+                # 现在每次不解码都要说一句为什么，钱的口径当场对平。
+                why = ("这条出口被限流/拉黑，打码解不了，只换出口" if hard else
+                       ("「解验证码」关着（这一页不花钱）" if not getattr(scrape_detail, "solve_captcha", True)
+                        else ("没填验证码 Key" if not scrape_detail.capsolver_key else "没配上游代理串")))
+                try:
+                    prog(f"    这次不解码：{why}")
+                except Exception:
+                    pass
             if can_solve and try_solve_challenge(page, up, scrape_detail.capsolver_key,
                                                  origin_url=detail_url, log=prog):
                 clean, _dt = page_status(page)
@@ -942,6 +976,19 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                         return
                     route.continue_()
                 page.route("**/*", _block_request)
+                # 每条车道的出口落到哪里：浏览器一起来就先读一次出口 IP + 归属地。
+                # 代理写法带 sid（粘性）时先用 Python 走同一个 sid 的上游读（超时说话算数，
+                # <=3.5 秒）；不粘性时厂家每个连接给随机号，那样读出来的不是这条车道在用的号，
+                # 就只让浏览器自己在隧道里读。取不到最多损失一行日志，不影响这一轮抓取。
+                # 界面「日志写出口IP」取消勾选时 enabled() 直接返回 False，一个请求都不发。
+                try:
+                    _egress = egress.probe_sync(
+                        page, session,
+                        upstream_proxy if egress.is_sticky(proxy_template) else "")
+                    if _egress:
+                        _progress(f"[W{worker_id}] {_egress}")
+                except Exception:
+                    pass
 
                 try:
                     _progress(f"[W{worker_id}] 加载列表页...")
@@ -965,6 +1012,11 @@ def process_address(address, proxy_template, proxy_pass, capsolver_key, worker_i
                             if try_solve_challenge(page, upstream_proxy, capsolver_key, log=_progress):
                                 clean, title = page_status(page)
                                 _progress(f"[W{worker_id}] 验证码通过，继续采集")
+                        else:
+                            why = ("这页是限流/拉黑硬页，打码解不了" if hard else
+                                   ("「解验证码」关着（不花钱，只换出口 IP）" if not solve_captcha
+                                    else "没填验证码 Key"))
+                            _progress(f"[W{worker_id}] 被拦但不解码：{why}")
                         if not clean:
                             what = {"rate": "限流", "block": "拉黑"}.get(hard, "拦")
                             last_error = f"{what}: {title or 'challenge'}"
